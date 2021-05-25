@@ -83,10 +83,10 @@ func TestDataSyncService_Start(t *testing.T) {
 		BeginTs: timeRange.timestampMin,
 		EndTs:   timeRange.timestampMax,
 		Msgs:    insertMessages,
-		StartPositions: []*internalpb.MsgPosition{&internalpb.MsgPosition{
+		StartPositions: []*internalpb.MsgPosition{{
 			ChannelName: insertChannelName,
 		}},
-		EndPositions: []*internalpb.MsgPosition{&internalpb.MsgPosition{
+		EndPositions: []*internalpb.MsgPosition{{
 			ChannelName: insertChannelName,
 		}},
 	}
