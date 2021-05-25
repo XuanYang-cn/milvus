@@ -441,6 +441,103 @@ func (s *Server) stopServerLoop() {
 	s.serverLoopWg.Wait()
 }
 
+func (s *Server) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
+	resp := &internalpb.ComponentStates{
+		State: &internalpb.ComponentInfo{
+			NodeID:    Params.NodeID,
+			Role:      role,
+			StateCode: s.state.Load().(internalpb.StateCode),
+		},
+		Status: &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_UnexpectedError,
+		},
+	}
+	dataNodeStates, err := s.cluster.GetDataNodeStates(ctx)
+	if err != nil {
+		resp.Status.Reason = err.Error()
+		return resp, nil
+	}
+	resp.SubcomponentStates = dataNodeStates
+	resp.Status.ErrorCode = commonpb.ErrorCode_Success
+	return resp, nil
+}
+
+func (s *Server) GetTimeTickChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+	return &milvuspb.StringResponse{
+		Status: &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_Success,
+		},
+		Value: Params.TimeTickChannelName,
+	}, nil
+}
+
+func (s *Server) GetStatisticsChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+	return &milvuspb.StringResponse{
+		Status: &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_Success,
+		},
+		Value: Params.StatisticsChannelName,
+	}, nil
+}
+
+func (s *Server) RegisterNode(ctx context.Context, req *datapb.RegisterNodeRequest) (*datapb.RegisterNodeResponse, error) {
+	ret := &datapb.RegisterNodeResponse{
+		Status: &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_UnexpectedError,
+		},
+	}
+	log.Debug("DataService: RegisterNode:", zap.String("IP", req.Address.Ip), zap.Int64("Port", req.Address.Port))
+	node, err := s.newDataNode(req.Address.Ip, req.Address.Port, req.Base.SourceID)
+	if err != nil {
+		ret.Status.Reason = err.Error()
+		return ret, nil
+	}
+
+	resp, err := node.client.WatchDmChannels(s.ctx, &datapb.WatchDmChannelsRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:   0,
+			MsgID:     0,
+			Timestamp: 0,
+			SourceID:  Params.NodeID,
+		},
+		// Vchannels: vchannels, // TODO
+	})
+
+	if err = VerifyResponse(resp, err); err != nil {
+		ret.Status.Reason = err.Error()
+		return ret, nil
+	}
+
+	if err := s.getDDChannel(); err != nil {
+		ret.Status.Reason = err.Error()
+		return ret, nil
+	}
+
+	if s.ttBarrier != nil {
+		if err = s.ttBarrier.AddPeer(node.id); err != nil {
+			ret.Status.Reason = err.Error()
+			return ret, nil
+		}
+	}
+
+	if err = s.cluster.Register(node); err != nil {
+		ret.Status.Reason = err.Error()
+		return ret, nil
+	}
+
+	ret.Status.ErrorCode = commonpb.ErrorCode_Success
+	ret.InitParams = &internalpb.InitParams{
+		NodeID: Params.NodeID,
+		StartParams: []*commonpb.KeyValuePair{
+			{Key: "DDChannelName", Value: s.ddChannelMu.name},
+			{Key: "SegmentStatisticsChannelName", Value: Params.StatisticsChannelName},
+			{Key: "TimeTickChannelName", Value: Params.TimeTickChannelName},
+			{Key: "CompleteFlushChannelName", Value: Params.SegmentInfoChannelName},
+		},
+	}
+	return ret, nil
+}
+
 func (s *Server) newDataNode(ip string, port int64, id UniqueID) (*dataNode, error) {
 	client := s.createDataNodeClient(fmt.Sprintf("%s:%d", ip, port))
 	if err := client.Init(); err != nil {
