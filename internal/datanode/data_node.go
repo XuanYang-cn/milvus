@@ -213,7 +213,7 @@ func (node *DataNode) WatchDmChannels(ctx context.Context, in *datapb.WatchDmCha
 		return status, errors.New(status.GetReason())
 
 	case len(in.GetVchannels()) == 0:
-		status.Reason = fmt.Sprintf("Illegal request")
+		status.Reason = "Illegal request"
 		return status, errors.New(status.GetReason())
 
 	default:
@@ -264,7 +264,7 @@ func (node *DataNode) FlushSegments(ctx context.Context, req *datapb.FlushSegmen
 		}
 		flushCh, ok := node.vchan2FlushCh[chanName]
 		if !ok {
-			status.Reason = fmt.Sprintf("DataNode abnormal!")
+			status.Reason = "DataNode abnormal!"
 			return status, errors.New(status.GetReason())
 		}
 
