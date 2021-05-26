@@ -33,7 +33,7 @@ func newClusterSessionManager() *clusterSessionManager {
 }
 
 func (m *clusterSessionManager) createSession(addr string) error {
-	cli := grpcdatanodeclient.NewClient(addr)
+	cli, _ := grpcdatanodeclient.NewClient(addr)
 	if err := cli.Init(); err != nil {
 		return err
 	}
