@@ -25,6 +25,9 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     echo "WARN: Cannot find $LIBJEMALLOC"
   fi
 fi
+echo "Starting datanode..."
+nohup ./bin/milvus run datanode > /tmp/datanode.log 2>&1 &
+sleep 1
 
 echo "Starting rootcoord..."
 nohup ./bin/milvus run rootcoord > /tmp/rootcoord.log 2>&1 &
@@ -32,8 +35,6 @@ nohup ./bin/milvus run rootcoord > /tmp/rootcoord.log 2>&1 &
 echo "Starting datacoord..."
 nohup ./bin/milvus run datacoord > /tmp/datacoord.log 2>&1 &
 
-echo "Starting datanode..."
-nohup ./bin/milvus run datanode > /tmp/datanode.log 2>&1 &
 
 echo "Starting proxy..."
 nohup ./bin/milvus run proxy > /tmp/proxy.log 2>&1 &

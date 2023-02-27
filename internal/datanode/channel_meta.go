@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/pkg/common"
@@ -62,6 +63,7 @@ type Channel interface {
 	getCollectionSchema(collectionID UniqueID, ts Timestamp) (*schemapb.CollectionSchema, error)
 	getCollectionAndPartitionID(segID UniqueID) (collID, partitionID UniqueID, err error)
 	getChannelName(segID UniqueID) string
+	getMeta() (*etcdpb.CollectionMeta, error)
 
 	addSegment(req addSegmentReq) error
 	getSegment(segID UniqueID) *Segment
@@ -659,6 +661,27 @@ func (c *ChannelMeta) getCollectionSchema(collID UniqueID, ts Timestamp) (*schem
 	}
 
 	return c.collSchema, nil
+}
+
+func (c *ChannelMeta) getMeta() (*etcdpb.CollectionMeta, error) {
+	c.schemaMut.RLock()
+	if c.collSchema == nil {
+		c.schemaMut.RUnlock()
+
+		c.schemaMut.Lock()
+		defer c.schemaMut.Unlock()
+		if c.collSchema == nil {
+			sch, err := c.metaService.getCollectionSchema(context.Background(), c.collectionID, 0)
+			if err != nil {
+				return nil, err
+			}
+			c.collSchema = sch
+		}
+	} else {
+		defer c.schemaMut.RUnlock()
+	}
+
+	return &etcdpb.CollectionMeta{ID: c.collectionID, Schema: c.collSchema}, nil
 }
 
 func (c *ChannelMeta) mergeFlushedSegments(ctx context.Context, seg *Segment, planID UniqueID, compactedFrom []UniqueID) error {
