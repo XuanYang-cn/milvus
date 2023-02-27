@@ -33,12 +33,14 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/importutil"
+
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
@@ -270,6 +272,46 @@ func (node *DataNode) Compaction(ctx context.Context, req *datapb.CompactionPlan
 		log.Warn("DataNode.Compaction failed", zap.Int64("nodeId", paramtable.GetNodeID()), zap.Error(err))
 		return merr.Status(err), nil
 	}
+	return node.CompactionV2(req)
+	// status := &commonpb.Status{
+	//     ErrorCode: commonpb.ErrorCode_UnexpectedError,
+	// }
+	//
+	// ds, ok := node.flowgraphManager.getFlowgraphService(req.GetChannel())
+	// if !ok {
+	//     log.Warn("illegel compaction plan, channel not in this DataNode", zap.String("channel name", req.GetChannel()))
+	//     status.Reason = errIllegalCompactionPlan.Error()
+	//     return status, nil
+	// }
+	//
+	// if !node.compactionExecutor.channelValidateForCompaction(req.GetChannel()) {
+	//     log.Warn("channel of compaction is marked invalid in compaction executor", zap.String("channel name", req.GetChannel()))
+	//     status.Reason = "channel marked invalid"
+	//     return status, nil
+	// }
+	//
+	// binlogIO := &binlogIO{node.chunkManager, ds.idAllocator}
+	// task := newCompactionTask(
+	//     node.ctx,
+	//     binlogIO, binlogIO,
+	//     ds.channel,
+	//     ds.flushManager,
+	//     ds.idAllocator,
+	//     req,
+	//     node.chunkManager,
+	// )
+	//
+	// node.compactionExecutor.execute(task)
+	//
+	// return &commonpb.Status{
+	//     ErrorCode: commonpb.ErrorCode_Success,
+	// }, nil
+}
+
+func (node *DataNode) CompactionV2(req *datapb.CompactionPlan) (*commonpb.Status, error) {
+	status := &commonpb.Status{
+		ErrorCode: commonpb.ErrorCode_UnexpectedError,
+	}
 
 	ds, ok := node.flowgraphManager.getFlowgraphService(req.GetChannel())
 	if !ok {
@@ -282,25 +324,21 @@ func (node *DataNode) Compaction(ctx context.Context, req *datapb.CompactionPlan
 		return merr.Status(merr.WrapErrChannelNotFound(req.GetChannel(), "channel is dropping")), nil
 	}
 
-	binlogIO := &binlogIO{node.chunkManager, ds.idAllocator}
-	task := newCompactionTask(
-		node.ctx,
-		binlogIO, binlogIO,
-		ds.channel,
-		ds.flushManager,
-		ds.idAllocator,
-		req,
-		node.chunkManager,
-	)
+	// Get collection meta
+	meta, _ := ds.channel.getMeta()
+	_, partID, _ := ds.channel.getCollectionAndPartitionID(req.GetSegmentBinlogs()[0].GetSegmentID())
 
-	node.compactionExecutor.execute(task)
+	err := node.compactionFactory.CreateWorkLine(req, meta, partID)
+	if err != nil {
+		log.Warn("create workline fail", zap.String("channel name", req.GetChannel()))
+		status.Reason = "create workline fail"
+		return status, nil
+	}
 
 	return merr.Status(nil), nil
 }
 
-// GetCompactionState called by DataCoord
-// return status of all compaction plans
-func (node *DataNode) GetCompactionState(ctx context.Context, req *datapb.CompactionStateRequest) (*datapb.CompactionStateResponse, error) {
+func (node *DataNode) GetCompactionStateV2(ctx context.Context, req *datapb.CompactionStateRequest) (*datapb.CompactionStateResponse, error) {
 	if !node.isHealthy() {
 		err := merr.WrapErrServiceNotReady(node.GetStateCode().String())
 		log.Warn("DataNode.GetCompactionState failed", zap.Int64("nodeId", paramtable.GetNodeID()), zap.Error(err))
@@ -308,23 +346,8 @@ func (node *DataNode) GetCompactionState(ctx context.Context, req *datapb.Compac
 			Status: merr.Status(err),
 		}, nil
 	}
-	results := make([]*datapb.CompactionStateResult, 0)
-	node.compactionExecutor.executing.Range(func(k, v any) bool {
-		results = append(results, &datapb.CompactionStateResult{
-			State:  commonpb.CompactionState_Executing,
-			PlanID: k.(UniqueID),
-		})
-		return true
-	})
-	node.compactionExecutor.completed.Range(func(k, v any) bool {
-		results = append(results, &datapb.CompactionStateResult{
-			State:  commonpb.CompactionState_Completed,
-			PlanID: k.(UniqueID),
-			Result: v.(*datapb.CompactionResult),
-		})
-		return true
-	})
 
+	results := node.compactionFactory.GetAllResults()
 	if len(results) > 0 {
 		log.Info("Compaction results", zap.Any("results", results))
 	}
@@ -332,6 +355,43 @@ func (node *DataNode) GetCompactionState(ctx context.Context, req *datapb.Compac
 		Status:  merr.Status(nil),
 		Results: results,
 	}, nil
+}
+
+// GetCompactionState called by DataCoord
+// return status of all compaction plans
+func (node *DataNode) GetCompactionState(ctx context.Context, req *datapb.CompactionStateRequest) (*datapb.CompactionStateResponse, error) {
+	return node.GetCompactionStateV2(ctx, req)
+	// if !node.isHealthy() {
+	//     err := merr.WrapErrServiceNotReady(node.GetStateCode().String())
+	//     log.Warn("DataNode.GetCompactionState failed", zap.Int64("nodeId", paramtable.GetNodeID()), zap.Error(err))
+	//     return &datapb.CompactionStateResponse{
+	//         Status: merr.Status(err),
+	//     }, nil
+	// }
+	// results := make([]*datapb.CompactionStateResult, 0)
+	// node.compactionExecutor.executing.Range(func(k, v any) bool {
+	//     results = append(results, &datapb.CompactionStateResult{
+	//         State:  commonpb.CompactionState_Executing,
+	//         PlanID: k.(UniqueID),
+	//     })
+	//     return true
+	// })
+	// node.compactionExecutor.completed.Range(func(k, v any) bool {
+	//     results = append(results, &datapb.CompactionStateResult{
+	//         State:  commonpb.CompactionState_Completed,
+	//         PlanID: k.(UniqueID),
+	//         Result: v.(*datapb.CompactionResult),
+	//     })
+	//     return true
+	// })
+	//
+	// if len(results) > 0 {
+	//     log.Info("Compaction results", zap.Any("results", results))
+	// }
+	// return &datapb.CompactionStateResponse{
+	//     Status:  merr.Status(nil),
+	//     Results: results,
+	// }, nil
 }
 
 // SyncSegments called by DataCoord, sync the compacted segments' meta between DC and DN

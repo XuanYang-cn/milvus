@@ -329,11 +329,12 @@ func (c *compactionPlanHandler) updateCompaction(ts Timestamp) error {
 			continue
 		}
 
-		log.Info("compaction failed", zap.Int64("planID", task.plan.PlanID), zap.Int64("nodeID", task.dataNodeID))
-		c.plans[planID] = c.plans[planID].shadowClone(setState(failed))
-		c.setSegmentsCompacting(task.plan, false)
-		c.executingTaskNum--
-		c.releaseQueue(task.dataNodeID)
+		// TODO GOOSE: no juse ignore what's not in the returned results
+		// log.Info("compaction failed", zap.Int64("planID", task.plan.PlanID), zap.Int64("nodeID", task.dataNodeID))
+		// c.plans[planID] = c.plans[planID].shadowClone(setState(failed))
+		// c.setSegmentsCompacting(task.plan, false)
+		// c.executingTaskNum--
+		// c.releaseQueue(task.dataNodeID)
 	}
 
 	return nil

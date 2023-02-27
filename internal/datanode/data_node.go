@@ -39,7 +39,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/datanode/allocator"
+
 	"github.com/milvus-io/milvus/internal/kv"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
@@ -56,6 +56,11 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/retry"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
+
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/compaction"
+	dio "github.com/milvus-io/milvus/internal/datanode/io"
+	"github.com/milvus-io/milvus/internal/datanode/resource"
 )
 
 const (
@@ -108,6 +113,7 @@ type DataNode struct {
 	clearSignal        chan string // vchannel name
 	segmentCache       *Cache
 	compactionExecutor *compactionExecutor
+	compactionFactory  *compaction.CompactionFactory
 
 	etcdCli   *clientv3.Client
 	address   string
@@ -149,6 +155,7 @@ func NewDataNode(ctx context.Context, factory dependency.Factory) *DataNode {
 		flowgraphManager: newFlowgraphManager(),
 		clearSignal:      make(chan string, 100),
 	}
+
 	node.UpdateStateCode(commonpb.StateCode_Abnormal)
 	return node
 }
@@ -533,6 +540,12 @@ func (node *DataNode) Start() error {
 		}
 
 		node.chunkManager = chunkManager
+
+		resources := &resource.GlobalResources{}
+		bio := dio.NewBinlogIO(node.chunkManager, resources)
+		compactionFactory := compaction.NewCompactionFactory(bio, resources, node.allocator)
+		node.compactionFactory = compactionFactory
+		go node.compactionFactory.Start(node.ctx)
 
 		node.wg.Add(1)
 		go node.BackGroundGC(node.clearSignal)

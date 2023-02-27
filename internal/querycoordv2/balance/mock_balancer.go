@@ -82,9 +82,9 @@ type MockBalancer_AssignSegment_Call struct {
 }
 
 // AssignSegment is a helper method to define mock.On call
-//   - collectionID int64
-//   - segments []*meta.Segment
-//   - nodes []int64
+//  - collectionID int64
+//  - segments []*meta.Segment
+//  - nodes []int64
 func (_e *MockBalancer_Expecter) AssignSegment(collectionID interface{}, segments interface{}, nodes interface{}) *MockBalancer_AssignSegment_Call {
 	return &MockBalancer_AssignSegment_Call{Call: _e.mock.On("AssignSegment", collectionID, segments, nodes)}
 }
