@@ -27,7 +27,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/datanode/allocator"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/flowgraph"
@@ -35,6 +34,9 @@ import (
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/retry"
+
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 )
 
 var deleteNodeTestDir = "/tmp/milvus_test/deleteNode"
@@ -61,7 +63,7 @@ func TestFlowGraphDeleteNode_newDeleteNode(te *testing.T) {
 	}
 }
 
-func genMockChannel(segIDs []int64, pks []primaryKey, chanName string) *ChannelMeta {
+func genMockChannel(segIDs []int64, pks []storage.PrimaryKey, chanName string) *meta.ChannelMeta {
 	pkStat1 := &storage.PkStatistics{
 		PkFilter: bloom.NewWithEstimates(1000000, 0.01),
 	}

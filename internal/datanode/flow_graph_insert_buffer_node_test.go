@@ -36,7 +36,6 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/datanode/allocator"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/storage"
@@ -48,6 +47,9 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/retry"
 	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
+
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 )
 
 var insertNodeTestDir = "/tmp/milvus_test/insert_node"
@@ -724,8 +726,8 @@ func TestInsertBufferNodeRollBF(t *testing.T) {
 type InsertBufferNodeSuite struct {
 	suite.Suite
 
-	channel       *ChannelMeta
-	delBufManager *DeltaBufferManager
+	channel       *meta.ChannelMeta
+	delBufManager *meta.DeltaBufferManager
 
 	collID UniqueID
 	partID UniqueID

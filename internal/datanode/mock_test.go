@@ -37,6 +37,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/internal/storage"
 	s "github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
@@ -848,7 +849,7 @@ func (df *DataFactory) GetMsgStreamInsertMsgs(n int) (msgs []*msgstream.InsertMs
 	return
 }
 
-func (df *DataFactory) GenMsgStreamDeleteMsg(pks []primaryKey, chanName string) *msgstream.DeleteMsg {
+func (df *DataFactory) GenMsgStreamDeleteMsg(pks []storage.PrimaryKey, chanName string) *msgstream.DeleteMsg {
 	idx := 100
 	timestamps := make([]Timestamp, len(pks))
 	for i := 0; i < len(pks); i++ {
@@ -877,7 +878,7 @@ func (df *DataFactory) GenMsgStreamDeleteMsg(pks []primaryKey, chanName string) 
 	return msg
 }
 
-func (df *DataFactory) GenMsgStreamDeleteMsgWithTs(idx int, pks []primaryKey, chanName string, ts Timestamp) *msgstream.DeleteMsg {
+func (df *DataFactory) GenMsgStreamDeleteMsgWithTs(idx int, pks []storage.PrimaryKey, chanName string, ts Timestamp) *msgstream.DeleteMsg {
 	var msg = &msgstream.DeleteMsg{
 		BaseMsg: msgstream.BaseMsg{
 			HashValues:     []uint32{uint32(idx)},
@@ -934,7 +935,7 @@ func genFlowGraphInsertMsg(chanName string) flowGraphMsg {
 	return *fgMsg
 }
 
-func genFlowGraphDeleteMsg(pks []primaryKey, chanName string) flowGraphMsg {
+func genFlowGraphDeleteMsg(pks []storage.PrimaryKey, chanName string) flowGraphMsg {
 	timeRange := TimeRange{
 		timestampMin: 0,
 		timestampMax: math.MaxUint64,
@@ -1099,7 +1100,7 @@ func (f *FailMessageStreamFactory) NewTtMsgStream(ctx context.Context) (msgstrea
 	return nil, errors.New("mocked failure")
 }
 
-func genInsertDataWithPKs(PKs [2]primaryKey, dataType schemapb.DataType) *InsertData {
+func genInsertDataWithPKs(PKs [2]storage.PrimaryKey, dataType schemapb.DataType) *InsertData {
 	iD := genInsertData()
 	switch dataType {
 	case schemapb.DataType_Int64:

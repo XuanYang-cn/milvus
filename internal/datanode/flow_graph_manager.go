@@ -25,6 +25,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
@@ -151,9 +152,9 @@ func (fm *flowgraphManager) getFlushCh(segID UniqueID) (chan<- flushMsg, error) 
 	return nil, merr.WrapErrSegmentNotFound(segID, "failed to get flush channel has this segment")
 }
 
-func (fm *flowgraphManager) getChannel(segID UniqueID) (Channel, error) {
+func (fm *flowgraphManager) getChannel(segID UniqueID) (meta.Channel, error) {
 	var (
-		rep    Channel
+		rep    meta.Channel
 		exists = false
 	)
 	fm.flowgraphs.Range(func(key, value interface{}) bool {

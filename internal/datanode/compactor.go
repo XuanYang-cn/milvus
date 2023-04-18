@@ -26,13 +26,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"go.uber.org/zap"
-	"golang.org/x/sync/errgroup"
-
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
 	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/storage"
@@ -43,7 +38,13 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/metautil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
+
+	"github.com/cockroachdb/errors"
+	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -73,7 +74,7 @@ type compactionTask struct {
 	downloader
 	uploader
 	compactor
-	Channel
+	meta.Channel
 	flushManager
 	allocator.Allocator
 
@@ -95,7 +96,7 @@ func newCompactionTask(
 	ctx context.Context,
 	dl downloader,
 	ul uploader,
-	channel Channel,
+	channel meta.Channel,
 	fm flushManager,
 	alloc allocator.Allocator,
 	plan *datapb.CompactionPlan,
@@ -137,7 +138,7 @@ func (t *compactionTask) getChannelName() string {
 }
 
 func (t *compactionTask) mergeDeltalogs(dBlobs map[UniqueID][]*Blob, timetravelTs Timestamp) (
-	map[interface{}]Timestamp, *DelDataBuf, error) {
+	map[interface{}]Timestamp, *meta.DelDataBuf, error) {
 	log := log.With(zap.Int64("planID", t.getPlanID()))
 	mergeStart := time.Now()
 	dCodec := storage.NewDeleteCodec()
@@ -146,7 +147,7 @@ func (t *compactionTask) mergeDeltalogs(dBlobs map[UniqueID][]*Blob, timetravelT
 		pk2ts = make(map[interface{}]Timestamp)
 		dbuff = &DelDataBuf{
 			delData: &DeleteData{
-				Pks: make([]primaryKey, 0),
+				Pks: make([]storage.PrimaryKey, 0),
 				Tss: make([]Timestamp, 0)},
 			Binlog: datapb.Binlog{
 				TimestampFrom: math.MaxUint64,

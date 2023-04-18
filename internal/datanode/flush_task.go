@@ -25,6 +25,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 	"github.com/milvus-io/milvus/internal/kv"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/log"
@@ -152,7 +153,7 @@ func (t *flushTaskRunner) runFlushInsert(task flushInsertTask,
 }
 
 // runFlushDel execute flush delete task with once and retry
-func (t *flushTaskRunner) runFlushDel(task flushDeleteTask, deltaLogs *DelDataBuf, opts ...retry.Option) {
+func (t *flushTaskRunner) runFlushDel(task flushDeleteTask, deltaLogs *meta.DelDataBuf, opts ...retry.Option) {
 	t.deleteOnce.Do(func() {
 		if deltaLogs == nil {
 			t.deltaLogs = nil //[]*DelDataBuf{}

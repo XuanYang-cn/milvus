@@ -32,13 +32,15 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/datanode/allocator"
 	memkv "github.com/milvus-io/milvus/internal/kv/mem"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
+
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 )
 
 var compactTestDir = "/tmp/milvus_test/compact"
@@ -873,14 +875,14 @@ type mockFlushManager struct {
 
 var _ flushManager = (*mockFlushManager)(nil)
 
-func (mfm *mockFlushManager) flushBufferData(data *BufferData, segmentID UniqueID, flushed bool, dropped bool, pos *msgpb.MsgPosition) ([]*Blob, error) {
+func (mfm *mockFlushManager) flushBufferData(data *meta.BufferData, segmentID UniqueID, flushed bool, dropped bool, pos *msgpb.MsgPosition) ([]*Blob, error) {
 	if mfm.returnError {
 		return nil, fmt.Errorf("mock error")
 	}
 	return nil, nil
 }
 
-func (mfm *mockFlushManager) flushDelData(data *DelDataBuf, segmentID UniqueID, pos *msgpb.MsgPosition) error {
+func (mfm *mockFlushManager) flushDelData(data *meta.DelDataBuf, segmentID UniqueID, pos *msgpb.MsgPosition) error {
 	if mfm.returnError {
 		return fmt.Errorf("mock error")
 	}

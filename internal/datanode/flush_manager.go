@@ -30,7 +30,6 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus/internal/datanode/allocator"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/storage"
@@ -42,14 +41,17 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/retry"
 	"github.com/milvus-io/milvus/pkg/util/timerecord"
+
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 )
 
 // flushManager defines a flush manager signature
 type flushManager interface {
 	// notify flush manager insert buffer data
-	flushBufferData(data *BufferData, segmentID UniqueID, flushed bool, dropped bool, pos *msgpb.MsgPosition) ([]*Blob, error)
+	flushBufferData(data *meta.BufferData, segmentID UniqueID, flushed bool, dropped bool, pos *msgpb.MsgPosition) ([]*Blob, error)
 	// notify flush manager del buffer data
-	flushDelData(data *DelDataBuf, segmentID UniqueID, pos *msgpb.MsgPosition) error
+	flushDelData(data *meta.DelDataBuf, segmentID UniqueID, pos *msgpb.MsgPosition) error
 	// injectFlush injects compaction or other blocking task before flush sync
 	injectFlush(injection *taskInjection, segments ...UniqueID)
 	// startDropping changes flush manager into dropping mode
@@ -179,7 +181,7 @@ func (q *orderFlushQueue) enqueueInsertFlush(task flushInsertTask, binlogs, stat
 }
 
 // enqueueDelBuffer put delete buffer data into queue
-func (q *orderFlushQueue) enqueueDelFlush(task flushDeleteTask, deltaLogs *DelDataBuf, pos *msgpb.MsgPosition) {
+func (q *orderFlushQueue) enqueueDelFlush(task flushDeleteTask, deltaLogs *meta.DelDataBuf, pos *msgpb.MsgPosition) {
 	q.getFlushTaskRunner(pos).runFlushDel(task, deltaLogs)
 }
 
@@ -265,7 +267,7 @@ type dropHandler struct {
 type rendezvousFlushManager struct {
 	allocator.Allocator
 	storage.ChunkManager
-	Channel
+	meta.Channel
 
 	// segment id => flush queue
 	dispatcher sync.Map
@@ -312,7 +314,7 @@ func (m *rendezvousFlushManager) handleInsertTask(segmentID UniqueID, task flush
 	m.getFlushQueue(segmentID).enqueueInsertFlush(task, binlogs, statslogs, flushed, dropped, pos)
 }
 
-func (m *rendezvousFlushManager) handleDeleteTask(segmentID UniqueID, task flushDeleteTask, deltaLogs *DelDataBuf, pos *msgpb.MsgPosition) {
+func (m *rendezvousFlushManager) handleDeleteTask(segmentID UniqueID, task flushDeleteTask, deltaLogs *meta.DelDataBuf, pos *msgpb.MsgPosition) {
 	log.Info("handling delete task", zap.Int64("segment ID", segmentID))
 	// in dropping mode
 	if m.dropping.Load() {
@@ -342,7 +344,7 @@ func (m *rendezvousFlushManager) handleDeleteTask(segmentID UniqueID, task flush
 
 // flushBufferData notifies flush manager insert buffer data.
 // This method will be retired on errors. Final errors will be propagated upstream and logged.
-func (m *rendezvousFlushManager) flushBufferData(data *BufferData, segmentID UniqueID, flushed bool, dropped bool, pos *msgpb.MsgPosition) ([]*Blob, error) {
+func (m *rendezvousFlushManager) flushBufferData(data *meta.BufferData, segmentID UniqueID, flushed bool, dropped bool, pos *msgpb.MsgPosition) ([]*Blob, error) {
 	tr := timerecord.NewTimeRecorder("flushDuration")
 	// empty flush
 	if data == nil || data.buffer == nil {
@@ -436,7 +438,7 @@ func (m *rendezvousFlushManager) flushBufferData(data *BufferData, segmentID Uni
 }
 
 // notify flush manager del buffer data
-func (m *rendezvousFlushManager) flushDelData(data *DelDataBuf, segmentID UniqueID,
+func (m *rendezvousFlushManager) flushDelData(data *meta.DelDataBuf, segmentID UniqueID,
 	pos *msgpb.MsgPosition) error {
 
 	// del signal with empty data
@@ -617,7 +619,7 @@ func (t *flushBufferDeleteTask) flushDeleteData() error {
 }
 
 // NewRendezvousFlushManager create rendezvousFlushManager with provided allocator and kv
-func NewRendezvousFlushManager(allocator allocator.Allocator, cm storage.ChunkManager, channel Channel, f notifyMetaFunc, drop flushAndDropFunc) *rendezvousFlushManager {
+func NewRendezvousFlushManager(allocator allocator.Allocator, cm storage.ChunkManager, channel meta.Channel, f notifyMetaFunc, drop flushAndDropFunc) *rendezvousFlushManager {
 	fm := &rendezvousFlushManager{
 		Allocator:    allocator,
 		ChunkManager: cm,

@@ -31,6 +31,9 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/retry"
 	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
+
+	"github.com/milvus-io/milvus/internal/datanode/meta"
+	"github.com/milvus-io/milvus/internal/datanode/util"
 )
 
 // DeleteNode is to process delete msg, flush delete info into storage.
@@ -38,8 +41,8 @@ type deleteNode struct {
 	BaseNode
 	ctx              context.Context
 	channelName      string
-	delBufferManager *DeltaBufferManager // manager of delete msg
-	channel          Channel
+	delBufferManager *meta.DeltaBufferManager // manager of delete msg
+	channel          meta.Channel
 	flushManager     flushManager
 
 	clearSignal chan<- string
@@ -152,7 +155,7 @@ func (dn *deleteNode) Operate(in []Msg) []Msg {
 	return in
 }
 
-func (dn *deleteNode) bufferDeleteMsg(msg *msgstream.DeleteMsg, tr TimeRange, startPos, endPos *msgpb.MsgPosition) ([]UniqueID, error) {
+func (dn *deleteNode) bufferDeleteMsg(msg *msgstream.DeleteMsg, tr util.TimeRange, startPos, endPos *msgpb.MsgPosition) ([]UniqueID, error) {
 	log.Debug("bufferDeleteMsg", zap.Any("primary keys", msg.PrimaryKeys), zap.String("vChannelName", dn.channelName))
 
 	primaryKeys := storage.ParseIDs2PrimaryKeys(msg.PrimaryKeys)
@@ -175,9 +178,9 @@ func (dn *deleteNode) bufferDeleteMsg(msg *msgstream.DeleteMsg, tr TimeRange, st
 // filterSegmentByPK returns the bloom filter check result.
 // If the key may exist in the segment, returns it in map.
 // If the key not exist in the segment, the segment is filter out.
-func (dn *deleteNode) filterSegmentByPK(partID UniqueID, pks []primaryKey, tss []Timestamp) (
-	map[UniqueID][]primaryKey, map[UniqueID][]uint64) {
-	segID2Pks := make(map[UniqueID][]primaryKey)
+func (dn *deleteNode) filterSegmentByPK(partID UniqueID, pks []storage.PrimaryKey, tss []Timestamp) (
+	map[UniqueID][]storage.PrimaryKey, map[UniqueID][]uint64) {
+	segID2Pks := make(map[UniqueID][]storage.PrimaryKey)
 	segID2Tss := make(map[UniqueID][]uint64)
 	segments := dn.channel.filterSegments(partID)
 	for index, pk := range pks {
@@ -193,7 +196,7 @@ func (dn *deleteNode) filterSegmentByPK(partID UniqueID, pks []primaryKey, tss [
 	return segID2Pks, segID2Tss
 }
 
-func newDeleteNode(ctx context.Context, fm flushManager, manager *DeltaBufferManager, sig chan<- string, config *nodeConfig) (*deleteNode, error) {
+func newDeleteNode(ctx context.Context, fm flushManager, manager *meta.DeltaBufferManager, sig chan<- string, config *nodeConfig) (*deleteNode, error) {
 	baseNode := BaseNode{}
 	baseNode.SetMaxQueueLength(config.maxQueueLength)
 	baseNode.SetMaxParallelism(config.maxParallelism)

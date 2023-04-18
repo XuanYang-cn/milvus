@@ -87,6 +87,11 @@ var Params *paramtable.ComponentParam = paramtable.Get()
 // rateCol is global rateCollector in DataNode.
 var rateCol *rateCollector
 
+type (
+	UniqueID  = typeutil.UniqueID
+	Timestamp = typeutil.Timestamp
+)
+
 // DataNode communicates with outside services and unioun all
 // services in datanode package.
 //

@@ -30,7 +30,6 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus/internal/datanode/allocator"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/flowgraph"
@@ -42,6 +41,10 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/retry"
 	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+
+	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
+	"github.com/milvus-io/milvus/internal/datanode/util"
 )
 
 type insertBufferNode struct {
@@ -49,8 +52,8 @@ type insertBufferNode struct {
 
 	ctx              context.Context
 	channelName      string
-	delBufferManager *DeltaBufferManager // manager of delete msg
-	channel          Channel
+	delBufferManager *meta.DeltaBufferManager // manager of delete msg
+	channel          meta.Channel
 	idAllocator      allocator.Allocator
 
 	flushMap         sync.Map
@@ -219,7 +222,7 @@ func (ibNode *insertBufferNode) Operate(in []Msg) []Msg {
 	return []Msg{&res}
 }
 
-func (ibNode *insertBufferNode) GetBufferIfFull(segID UniqueID) (*BufferData, bool) {
+func (ibNode *insertBufferNode) GetBufferIfFull(segID UniqueID) (*meta.BufferData, bool) {
 	if bd, ok := ibNode.channel.getCurInsertBuffer(segID); ok && bd.effectiveCap() <= 0 {
 		return bd, true
 	}
@@ -228,8 +231,8 @@ func (ibNode *insertBufferNode) GetBufferIfFull(segID UniqueID) (*BufferData, bo
 }
 
 // GetBuffer returns buffer data for a segment, returns nil if segment's not in buffer
-func (ibNode *insertBufferNode) GetBuffer(segID UniqueID) *BufferData {
-	var buf *BufferData
+func (ibNode *insertBufferNode) GetBuffer(segID UniqueID) *meta.BufferData {
+	var buf *meta.BufferData
 	if bd, ok := ibNode.channel.getCurInsertBuffer(segID); ok {
 		buf = bd
 	}
@@ -307,7 +310,7 @@ func (ibNode *insertBufferNode) updateSegmentsMemorySize(seg2Upload []UniqueID) 
 }
 
 type syncTask struct {
-	buffer    *BufferData
+	buffer    *meta.BufferData
 	segmentID UniqueID
 	flushed   bool
 	dropped   bool
@@ -624,11 +627,8 @@ func (ibNode *insertBufferNode) bufferInsertMsg(msg *msgstream.InsertMsg, startP
 	return nil
 }
 
-func (ibNode *insertBufferNode) getTimestampRange(tsData *storage.Int64FieldData) TimeRange {
-	tr := TimeRange{
-		timestampMin: math.MaxUint64,
-		timestampMax: 0,
-	}
+func (ibNode *insertBufferNode) getTimestampRange(tsData *storage.Int64FieldData) util.TimeRange {
+	tr := util.NewTimeRange(0, math.MaxUint64)
 
 	for _, data := range tsData.Data {
 		if uint64(data) < tr.timestampMin {
@@ -661,7 +661,7 @@ func (ibNode *insertBufferNode) getCollectionandPartitionIDbySegID(segmentID Uni
 	return ibNode.channel.getCollectionAndPartitionID(segmentID)
 }
 
-func newInsertBufferNode(ctx context.Context, collID UniqueID, delBufManager *DeltaBufferManager, flushCh <-chan flushMsg, resendTTCh <-chan resendTTMsg,
+func newInsertBufferNode(ctx context.Context, collID UniqueID, delBufManager *meta.DeltaBufferManager, flushCh <-chan flushMsg, resendTTCh <-chan resendTTMsg,
 	fm flushManager, flushingSegCache *Cache, config *nodeConfig) (*insertBufferNode, error) {
 
 	baseNode := BaseNode{}

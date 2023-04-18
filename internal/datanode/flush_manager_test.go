@@ -32,6 +32,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/schemapb"
 	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/util/retry"
@@ -143,8 +144,8 @@ func TestOrderFlushQueue_Order(t *testing.T) {
 	}
 }
 
-func newTestChannel() *ChannelMeta {
-	return &ChannelMeta{
+func newTestChannel() *meta.ChannelMeta {
+	return &meta.ChannelMeta{
 		segments: make(map[UniqueID]*Segment),
 	}
 }

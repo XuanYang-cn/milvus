@@ -33,6 +33,8 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 )
 
 const (
@@ -46,7 +48,7 @@ var _ flowgraph.Node = (*ttNode)(nil)
 type ttNode struct {
 	BaseNode
 	vChannelName   string
-	channel        Channel
+	channel        meta.Channel
 	lastUpdateTime time.Time
 	dataCoord      types.DataCoord
 }

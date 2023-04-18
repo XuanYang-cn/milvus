@@ -21,6 +21,8 @@ import (
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/flowgraph"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+
+	"github.com/milvus-io/milvus/internal/datanode/util"
 )
 
 type (
@@ -46,7 +48,7 @@ type flowGraphMsg struct {
 	BaseMsg
 	insertMessages []*msgstream.InsertMsg
 	deleteMessages []*msgstream.DeleteMsg
-	timeRange      TimeRange
+	timeRange      util.TimeRange
 	startPositions []*msgpb.MsgPosition
 	endPositions   []*msgpb.MsgPosition
 	//segmentsToSync is the signal used by insertBufferNode to notify deleteNode to flush

@@ -26,6 +26,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/commonpb"
 	"github.com/milvus-io/milvus/internal/datanode/allocator"
+	"github.com/milvus-io/milvus/internal/datanode/meta"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/types"
@@ -48,7 +49,7 @@ type dataSyncService struct {
 	fg           *flowgraph.TimeTickedFlowGraph // internal flowgraph processes insert/delta messages
 	flushCh      chan flushMsg
 	resendTTCh   chan resendTTMsg    // chan to ask for resending DataNode time tick message.
-	channel      Channel             // channel stores meta of channel
+	channel      meta.Channel        // channel stores meta of channel
 	idAllocator  allocator.Allocator // id/timestamp allocator
 	dispClient   msgdispatcher.Client
 	msFactory    msgstream.Factory
@@ -57,7 +58,7 @@ type dataSyncService struct {
 	dataCoord    types.DataCoord // DataCoord instance to interact with
 	clearSignal  chan<- string   // signal channel to notify flowgraph close for collection/partition drop msg consumed
 
-	delBufferManager *DeltaBufferManager
+	delBufferManager *meta.DeltaBufferManager
 	flushingSegCache *Cache       // a guarding cache stores currently flushing segment ids
 	flushManager     flushManager // flush manager handles flush process
 	chunkManager     storage.ChunkManager
@@ -71,7 +72,7 @@ type dataSyncService struct {
 func newDataSyncService(ctx context.Context,
 	flushCh chan flushMsg,
 	resendTTCh chan resendTTMsg,
-	channel Channel,
+	channel meta.Channel,
 	alloc allocator.Allocator,
 	dispClient msgdispatcher.Client,
 	factory msgstream.Factory,
@@ -91,7 +92,7 @@ func newDataSyncService(ctx context.Context,
 
 	ctx1, cancel := context.WithCancel(ctx)
 
-	delBufferManager := &DeltaBufferManager{
+	delBufferManager := &meta.DeltaBufferManager{
 		channel:    channel,
 		delBufHeap: &PriorityQueue{},
 	}
@@ -132,7 +133,7 @@ type nodeConfig struct {
 	msFactory    msgstream.Factory // msgStream factory
 	collectionID UniqueID
 	vChannelName string
-	channel      Channel // Channel info
+	channel      meta.Channel // Channel info
 	allocator    allocator.Allocator
 	serverID     int64
 	// defaults
