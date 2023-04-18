@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package datanode
+package meta
 
 import (
 	"container/heap"
@@ -23,18 +23,19 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cockroachdb/errors"
-	"go.uber.org/atomic"
-	"go.uber.org/zap"
-
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus/internal/datanode/util"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
+
+	"github.com/cockroachdb/errors"
+	"github.com/milvus-io/milvus-proto/go-api/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"go.uber.org/atomic"
+	"go.uber.org/zap"
 )
 
 // DeltaBufferManager is in charge of managing insertBuf and delBuf from an overall prospect
@@ -129,7 +130,7 @@ func (m *DeltaBufferManager) deleteFromHeap(buffer *DelDataBuf) {
 }
 
 func (m *DeltaBufferManager) StoreNewDeletes(segID UniqueID, pks []primaryKey,
-	tss []Timestamp, tr TimeRange, startPos, endPos *msgpb.MsgPosition) {
+	tss []Timestamp, tr util.TimeRange, startPos, endPos *msgpb.MsgPosition) {
 	buffer, loaded := m.Load(segID)
 	if !loaded {
 		buffer = newDelDataBuf(segID)
@@ -264,7 +265,7 @@ func (pq *PriorityQueue) update(item *Item, memorySize int64) {
 // BufferData buffers insert data, monitoring buffer size and limit
 // size and limit both indicate numOfRows
 type BufferData struct {
-	buffer   *InsertData
+	buffer   *storage.InsertData
 	size     int64
 	limit    int64
 	tsFrom   Timestamp
@@ -282,12 +283,12 @@ func (bd *BufferData) updateSize(no int64) {
 }
 
 // updateTimeRange update BufferData tsFrom, tsTo range according to input time range
-func (bd *BufferData) updateTimeRange(tr TimeRange) {
-	if tr.timestampMin < bd.tsFrom {
-		bd.tsFrom = tr.timestampMin
+func (bd *BufferData) updateTimeRange(tr util.TimeRange) {
+	if tr.Min() < bd.tsFrom {
+		bd.tsFrom = tr.Min()
 	}
-	if tr.timestampMax > bd.tsTo {
-		bd.tsTo = tr.timestampMax
+	if tr.Max() > bd.tsTo {
+		bd.tsTo = tr.Max()
 	}
 }
 
@@ -312,14 +313,14 @@ func (bd *BufferData) memorySize() int64 {
 // size and limit both indicate numOfRows
 type DelDataBuf struct {
 	datapb.Binlog
-	delData  *DeleteData
+	delData  *storage.DeleteData
 	item     *Item
 	startPos *msgpb.MsgPosition
 	endPos   *msgpb.MsgPosition
 }
 
 // Buffer returns the memory size buffered
-func (ddb *DelDataBuf) Buffer(pks []primaryKey, tss []Timestamp, tr TimeRange, startPos, endPos *msgpb.MsgPosition) int64 {
+func (ddb *DelDataBuf) Buffer(pks []primaryKey, tss []Timestamp, tr util.TimeRange, startPos, endPos *msgpb.MsgPosition) int64 {
 	var (
 		rowCount = len(pks)
 		bufSize  int64
@@ -365,19 +366,19 @@ func (ddb *DelDataBuf) accumulateEntriesNum(entryNum int64) {
 	ddb.EntriesNum += entryNum
 }
 
-func (ddb *DelDataBuf) updateTimeRange(tr TimeRange) {
-	if tr.timestampMin < ddb.TimestampFrom {
-		ddb.TimestampFrom = tr.timestampMin
+func (ddb *DelDataBuf) updateTimeRange(tr util.TimeRange) {
+	if tr.Min() < ddb.TimestampFrom {
+		ddb.TimestampFrom = tr.Min()
 	}
-	if tr.timestampMax > ddb.TimestampTo {
-		ddb.TimestampTo = tr.timestampMax
+	if tr.Max() > ddb.TimestampTo {
+		ddb.TimestampTo = tr.Max()
 	}
 }
 
 func (ddb *DelDataBuf) MergeDelDataBuf(buf *DelDataBuf) {
 	ddb.accumulateEntriesNum(buf.EntriesNum)
 
-	tr := TimeRange{timestampMax: buf.TimestampTo, timestampMin: buf.TimestampFrom}
+	tr := util.NewTimeRange(buf.TimestampFrom, buf.TimestampTo)
 	ddb.updateTimeRange(tr)
 	ddb.updateStartAndEndPosition(buf.startPos, buf.endPos)
 
@@ -432,7 +433,7 @@ func newBufferData(collSchema *schemapb.CollectionSchema) (*BufferData, error) {
 
 	//TODO::xige-16 eval vec and string field
 	return &BufferData{
-		buffer: &InsertData{Data: make(map[UniqueID]storage.FieldData)},
+		buffer: &storage.InsertData{Data: make(map[UniqueID]storage.FieldData)},
 		size:   0,
 		limit:  limit,
 		tsFrom: math.MaxUint64,
@@ -441,7 +442,7 @@ func newBufferData(collSchema *schemapb.CollectionSchema) (*BufferData, error) {
 
 func newDelDataBuf(segmentID UniqueID) *DelDataBuf {
 	return &DelDataBuf{
-		delData: &DeleteData{},
+		delData: &storage.DeleteData{},
 		Binlog: datapb.Binlog{
 			EntriesNum:    0,
 			TimestampFrom: math.MaxUint64,

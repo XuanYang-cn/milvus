@@ -14,28 +14,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package datanode
+package meta
 
 import (
 	"container/heap"
-	"context"
 	"fmt"
 	"math"
+	"math/rand"
+	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/milvus-io/milvus/internal/datanode/util"
 
 	"github.com/milvus-io/milvus-proto/go-api/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/datanode/allocator"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestMain(t *testing.M) {
+	rand.Seed(time.Now().Unix())
+	// init embed etcd
+	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	defer os.RemoveAll(tempDir)
+	defer embedetcdServer.Close()
+
+	addrs := etcd.GetEmbedEtcdEndpoints(embedetcdServer)
+	// setup env for etcd endpoint
+	os.Setenv("etcd.endpoints", strings.Join(addrs, ","))
+
+	path := "/tmp/milvus_ut/rdb_data"
+	os.Setenv("ROCKSMQ_PATH", path)
+	defer os.RemoveAll(path)
+
+	Params.Init()
+	// change to specific channel for test
+	paramtable.Get().Save(Params.EtcdCfg.Endpoints.Key, strings.Join(addrs, ","))
+
+	code := t.Run()
+	os.Exit(code)
+}
 
 func genTestCollectionSchema(dim int64, vectorType schemapb.DataType) *schemapb.CollectionSchema {
 	floatVecFieldSchema := &schemapb.FieldSchema{
@@ -103,7 +133,7 @@ func TestBufferData_updateTimeRange(t *testing.T) {
 	type testCase struct {
 		tag string
 
-		trs        []TimeRange
+		trs        []util.TimeRange
 		expectFrom Timestamp
 		expectTo   Timestamp
 	}
@@ -116,18 +146,18 @@ func TestBufferData_updateTimeRange(t *testing.T) {
 		},
 		{
 			tag: "single range",
-			trs: []TimeRange{
-				{timestampMin: 100, timestampMax: 200},
+			trs: []util.TimeRange{
+				util.NewTimeRange(100, 200),
 			},
 			expectFrom: 100,
 			expectTo:   200,
 		},
 		{
 			tag: "multiple range",
-			trs: []TimeRange{
-				{timestampMin: 150, timestampMax: 250},
-				{timestampMin: 100, timestampMax: 200},
-				{timestampMin: 50, timestampMax: 180},
+			trs: []util.TimeRange{
+				util.NewTimeRange(150, 250),
+				util.NewTimeRange(100, 200),
+				util.NewTimeRange(50, 180),
 			},
 			expectFrom: 50,
 			expectTo:   250,
@@ -231,95 +261,4 @@ func Test_CompactSegBuff(t *testing.T) {
 		Timestamp: 200,
 	})
 	assert.Equal(t, Timestamp(200), cp.Timestamp) // evict all buffer, use ttPos as cp
-}
-
-func TestUpdateCompactedSegments(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cm := storage.NewLocalChunkManager(storage.RootPath(deleteNodeTestDir))
-	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
-
-	fm := NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, nil, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
-
-	chanName := "datanode-test-FlowGraphDeletenode-showDelBuf"
-	testPath := "/test/datanode/root/meta"
-	assert.NoError(t, clearEtcd(testPath))
-	Params.BaseTable.Save("etcd.rootPath", "/test/datanode/root")
-
-	channel := ChannelMeta{
-		segments: make(map[UniqueID]*Segment),
-	}
-
-	c := &nodeConfig{
-		channel:      &channel,
-		vChannelName: chanName,
-	}
-	delBufManager := &DeltaBufferManager{
-		channel:    &channel,
-		delBufHeap: &PriorityQueue{},
-	}
-	delNode, err := newDeleteNode(ctx, fm, delBufManager, make(chan string, 1), c)
-	require.NoError(t, err)
-
-	tests := []struct {
-		description    string
-		compactToExist bool
-
-		compactedToIDs   []UniqueID
-		compactedFromIDs []UniqueID
-
-		expectedSegsRemain []UniqueID
-	}{
-		{"zero segments", false,
-			[]UniqueID{}, []UniqueID{}, []UniqueID{}},
-		{"segment no compaction", false,
-			[]UniqueID{}, []UniqueID{}, []UniqueID{100, 101}},
-		{"segment compacted", true,
-			[]UniqueID{200}, []UniqueID{103}, []UniqueID{100, 101}},
-		{"segment compacted 100>201", true,
-			[]UniqueID{201}, []UniqueID{100}, []UniqueID{101, 201}},
-		{"segment compacted 100+101>201", true,
-			[]UniqueID{201, 201}, []UniqueID{100, 101}, []UniqueID{201}},
-		{"segment compacted 100>201, 101>202", true,
-			[]UniqueID{201, 202}, []UniqueID{100, 101}, []UniqueID{201, 202}},
-		// false
-		{"segment compacted 100>201", false,
-			[]UniqueID{201}, []UniqueID{100}, []UniqueID{101}},
-		{"segment compacted 100+101>201", false,
-			[]UniqueID{201, 201}, []UniqueID{100, 101}, []UniqueID{}},
-		{"segment compacted 100>201, 101>202", false,
-			[]UniqueID{201, 202}, []UniqueID{100, 101}, []UniqueID{}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.description, func(t *testing.T) {
-			if test.compactToExist {
-				for _, segID := range test.compactedToIDs {
-					seg := Segment{
-						segmentID: segID,
-						numRows:   10,
-					}
-					seg.setType(datapb.SegmentType_Flushed)
-					channel.segments[segID] = &seg
-				}
-			} else { // clear all segments in channel
-				channel.segments = make(map[UniqueID]*Segment)
-			}
-
-			for i, segID := range test.compactedFromIDs {
-				seg := Segment{
-					segmentID:   segID,
-					compactedTo: test.compactedToIDs[i],
-				}
-				seg.setType(datapb.SegmentType_Compacted)
-				channel.segments[segID] = &seg
-			}
-
-			delNode.delBufferManager.UpdateCompactedSegments()
-
-			for _, remain := range test.expectedSegsRemain {
-				delNode.channel.hasSegment(remain, true)
-			}
-		})
-	}
 }

@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package datanode
+package util
 
 import (
 	"context"
@@ -43,6 +43,20 @@ type (
 type TimeRange struct {
 	timestampMin Timestamp
 	timestampMax Timestamp
+}
+
+func NewTimeRange(min, max Timestamp) TimeRange {
+	return TimeRange{
+		timestampMin: min,
+		timestampMax: max,
+	}
+}
+
+func (r TimeRange) Min() Timestamp {
+	return r.timestampMin
+}
+func (r TimeRange) Max() Timestamp {
+	return r.timestampMax
 }
 
 func startTracer(msg msgstream.TsMsg, name string) (context.Context, trace.Span) {

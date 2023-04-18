@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package datanode
+package meta
 
 import (
 	"context"
@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/samber/lo"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -38,65 +37,9 @@ import (
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
-
-type (
-	primaryKey        = storage.PrimaryKey
-	int64PrimaryKey   = storage.Int64PrimaryKey
-	varCharPrimaryKey = storage.VarCharPrimaryKey
-)
-
-var (
-	newInt64PrimaryKey   = storage.NewInt64PrimaryKey
-	newVarCharPrimaryKey = storage.NewVarCharPrimaryKey
-)
-
-// Channel is DataNode unique replication
-type Channel interface {
-	getCollectionID() UniqueID
-	getCollectionSchema(collectionID UniqueID, ts Timestamp) (*schemapb.CollectionSchema, error)
-	getCollectionAndPartitionID(segID UniqueID) (collID, partitionID UniqueID, err error)
-	getChannelName(segID UniqueID) string
-
-	listAllSegmentIDs() []UniqueID
-	listNotFlushedSegmentIDs() []UniqueID
-	addSegment(req addSegmentReq) error
-	listPartitionSegments(partID UniqueID) []UniqueID
-	filterSegments(partitionID UniqueID) []*Segment
-	listNewSegmentsStartPositions() []*datapb.SegmentStartPosition
-	transferNewSegments(segmentIDs []UniqueID)
-	updateSegmentPKRange(segID UniqueID, ids storage.FieldData)
-	mergeFlushedSegments(ctx context.Context, seg *Segment, planID UniqueID, compactedFrom []UniqueID) error
-	hasSegment(segID UniqueID, countFlushed bool) bool
-	removeSegments(segID ...UniqueID)
-	listCompactedSegmentIDs() map[UniqueID][]UniqueID
-	listSegmentIDsToSync(ts Timestamp) []UniqueID
-	setSegmentLastSyncTs(segID UniqueID, ts Timestamp)
-
-	updateSegmentRowNumber(segID UniqueID, numRows int64)
-	updateSegmentMemorySize(segID UniqueID, memorySize int64)
-	InitPKstats(ctx context.Context, s *Segment, statsBinlogs []*datapb.FieldBinlog, ts Timestamp) error
-	RollPKstats(segID UniqueID, stats []*storage.PrimaryKeyStats)
-	getSegmentStatisticsUpdates(segID UniqueID) (*commonpb.SegmentStats, error)
-	segmentFlushed(segID UniqueID)
-
-	getChannelCheckpoint(ttPos *msgpb.MsgPosition) *msgpb.MsgPosition
-
-	getCurInsertBuffer(segmentID UniqueID) (*BufferData, bool)
-	setCurInsertBuffer(segmentID UniqueID, buf *BufferData)
-	rollInsertBuffer(segmentID UniqueID)
-	evictHistoryInsertBuffer(segmentID UniqueID, endPos *msgpb.MsgPosition)
-
-	getCurDeleteBuffer(segmentID UniqueID) (*DelDataBuf, bool)
-	setCurDeleteBuffer(segmentID UniqueID, buf *DelDataBuf)
-	rollDeleteBuffer(segmentID UniqueID)
-	evictHistoryDeleteBuffer(segmentID UniqueID, endPos *msgpb.MsgPosition)
-
-	// getTotalMemorySize returns the sum of memory sizes of segments.
-	getTotalMemorySize() int64
-	forceToSync()
-}
 
 // ChannelMeta contains channel meta and the latest segments infos of the channel.
 type ChannelMeta struct {
@@ -113,16 +56,6 @@ type ChannelMeta struct {
 
 	metaService  *metaService
 	chunkManager storage.ChunkManager
-}
-
-type addSegmentReq struct {
-	segType                    datapb.SegmentType
-	segID, collID, partitionID UniqueID
-	numOfRows                  int64
-	startPos, endPos           *msgpb.MsgPosition
-	statsBinLogs               []*datapb.FieldBinlog
-	recoverTs                  Timestamp
-	importing                  bool
 }
 
 var _ Channel = &ChannelMeta{}
@@ -348,9 +281,9 @@ func (c *ChannelMeta) InitPKstats(ctx context.Context, s *Segment, statsBinlogs 
 		log.Warn("failed to load bloom filter files", zap.Error(err))
 		return err
 	}
-	blobs := make([]*Blob, 0)
+	blobs := make([]*storage.Blob, 0)
 	for i := 0; i < len(values); i++ {
-		blobs = append(blobs, &Blob{Value: values[i]})
+		blobs = append(blobs, &storage.Blob{Value: values[i]})
 	}
 
 	stats, err := storage.DeserializeStats(blobs)

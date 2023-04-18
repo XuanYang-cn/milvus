@@ -541,3 +541,94 @@ func TestFlowGraphDeleteNode_showDelBuf(t *testing.T) {
 
 	delNode.showDelBuf([]UniqueID{111, 112, 113}, 100)
 }
+
+func TestUpdateCompactedSegments(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cm := storage.NewLocalChunkManager(storage.RootPath(deleteNodeTestDir))
+	defer cm.RemoveWithPrefix(ctx, cm.RootPath())
+
+	fm := NewRendezvousFlushManager(allocator.NewMockAllocator(t), cm, nil, func(*segmentFlushPack) {}, emptyFlushAndDropFunc)
+
+	chanName := "datanode-test-FlowGraphDeletenode-showDelBuf"
+	testPath := "/test/datanode/root/meta"
+	assert.NoError(t, clearEtcd(testPath))
+	Params.BaseTable.Save("etcd.rootPath", "/test/datanode/root")
+
+	channel := ChannelMeta{
+		segments: make(map[UniqueID]*Segment),
+	}
+
+	c := &nodeConfig{
+		channel:      &channel,
+		vChannelName: chanName,
+	}
+	delBufManager := &DeltaBufferManager{
+		channel:    &channel,
+		delBufHeap: &PriorityQueue{},
+	}
+	delNode, err := newDeleteNode(ctx, fm, delBufManager, make(chan string, 1), c)
+	require.NoError(t, err)
+
+	tests := []struct {
+		description    string
+		compactToExist bool
+
+		compactedToIDs   []UniqueID
+		compactedFromIDs []UniqueID
+
+		expectedSegsRemain []UniqueID
+	}{
+		{"zero segments", false,
+			[]UniqueID{}, []UniqueID{}, []UniqueID{}},
+		{"segment no compaction", false,
+			[]UniqueID{}, []UniqueID{}, []UniqueID{100, 101}},
+		{"segment compacted", true,
+			[]UniqueID{200}, []UniqueID{103}, []UniqueID{100, 101}},
+		{"segment compacted 100>201", true,
+			[]UniqueID{201}, []UniqueID{100}, []UniqueID{101, 201}},
+		{"segment compacted 100+101>201", true,
+			[]UniqueID{201, 201}, []UniqueID{100, 101}, []UniqueID{201}},
+		{"segment compacted 100>201, 101>202", true,
+			[]UniqueID{201, 202}, []UniqueID{100, 101}, []UniqueID{201, 202}},
+		// false
+		{"segment compacted 100>201", false,
+			[]UniqueID{201}, []UniqueID{100}, []UniqueID{101}},
+		{"segment compacted 100+101>201", false,
+			[]UniqueID{201, 201}, []UniqueID{100, 101}, []UniqueID{}},
+		{"segment compacted 100>201, 101>202", false,
+			[]UniqueID{201, 202}, []UniqueID{100, 101}, []UniqueID{}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			if test.compactToExist {
+				for _, segID := range test.compactedToIDs {
+					seg := Segment{
+						segmentID: segID,
+						numRows:   10,
+					}
+					seg.setType(datapb.SegmentType_Flushed)
+					channel.segments[segID] = &seg
+				}
+			} else { // clear all segments in channel
+				channel.segments = make(map[UniqueID]*Segment)
+			}
+
+			for i, segID := range test.compactedFromIDs {
+				seg := Segment{
+					segmentID:   segID,
+					compactedTo: test.compactedToIDs[i],
+				}
+				seg.setType(datapb.SegmentType_Compacted)
+				channel.segments[segID] = &seg
+			}
+
+			delNode.delBufferManager.UpdateCompactedSegments()
+
+			for _, remain := range test.expectedSegsRemain {
+				delNode.channel.hasSegment(remain, true)
+			}
+		})
+	}
+}
