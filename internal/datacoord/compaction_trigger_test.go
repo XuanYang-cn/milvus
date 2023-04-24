@@ -25,6 +25,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/commonpb"
@@ -1995,4 +1996,58 @@ func (s *CompactionTriggerSuite) TestHandleGlobalSignal() {
 
 func TestCompactionTriggerSuite(t *testing.T) {
 	suite.Run(t, new(CompactionTriggerSuite))
+}
+
+func Test_PartitionView(t *testing.T) {
+	paramtable.Get().Save(Params.DataCoordCfg.SegmentMaxSize.Key, "100")
+	defer paramtable.Get().Reset(Params.DataCoordCfg.SegmentMaxSize.Key)
+
+	segments := []*SegmentInfo{
+		&SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{ID: 2, NumOfRows: 201, MaxRowNum: 1000},
+		},
+		&SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{ID: 1, NumOfRows: 102, MaxRowNum: 1000},
+		},
+		&SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{ID: 3, NumOfRows: 302, MaxRowNum: 1000},
+		},
+	}
+
+	pv := GetPartitionView(100, segments)
+	require.Equal(t, 3, len(pv.distribution))
+
+	pv.Next()
+	assert.Equal(t, 1, len(pv.distribution))
+	assert.InDelta(t, 60.5*1024*1024, pv.distribution[0].size, 10e-6)
+
+	t.Run("Next", func(t *testing.T) {
+		segments := []*SegmentInfo{
+			&SegmentInfo{
+				SegmentInfo: &datapb.SegmentInfo{ID: 1, NumOfRows: 1000, MaxRowNum: 1000},
+			},
+			&SegmentInfo{
+				SegmentInfo: &datapb.SegmentInfo{ID: 2, NumOfRows: 900, MaxRowNum: 1000},
+			},
+			&SegmentInfo{
+				SegmentInfo: &datapb.SegmentInfo{ID: 3, NumOfRows: 230, MaxRowNum: 1000},
+			},
+			&SegmentInfo{
+				SegmentInfo: &datapb.SegmentInfo{ID: 4, NumOfRows: 230, MaxRowNum: 1000},
+			},
+			&SegmentInfo{
+				SegmentInfo: &datapb.SegmentInfo{ID: 5, NumOfRows: 230, MaxRowNum: 1000},
+			},
+			&SegmentInfo{
+				SegmentInfo: &datapb.SegmentInfo{ID: 6, NumOfRows: 230, MaxRowNum: 1000},
+			},
+		}
+
+		pv := GetPartitionView(100, segments)
+		require.Equal(t, 6, len(pv.distribution))
+
+		pv.Next()
+		assert.Equal(t, 3, len(pv.distribution))
+		assert.InDelta(t, 92*1024*1024, pv.distribution[2].size, 10e-6)
+	})
 }

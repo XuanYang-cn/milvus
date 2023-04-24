@@ -19,7 +19,9 @@ package datacoord
 import (
 	"context"
 	"fmt"
+	"github.com/cockroachdb/errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +51,7 @@ type trigger interface {
 	triggerSingleCompaction(collectionID, partitionID, segmentID int64, channel string) error
 	// forceTriggerCompaction force to start a compaction
 	forceTriggerCompaction(collectionID int64) (UniqueID, error)
+	triggerManualCompaction(collectionID int64, segmentIDs []int64) (int64, error)
 }
 
 type compactionSignal struct {
@@ -228,6 +231,103 @@ func (t *compactionTrigger) triggerCompaction() error {
 	return nil
 }
 
+func (t *compactionTrigger) triggerManualCompaction(collectionID int64, segmentIDs []int64) (int64, error) {
+	id, err := t.allocSignalID()
+	if err != nil {
+		return -1, err
+	}
+	signal := &compactionSignal{
+		id:           id,
+		collectionID: collectionID,
+		isForce:      true,
+		isGlobal:     true,
+	}
+
+	log := log.With(zap.Int64("YX collectionID", collectionID))
+
+	t.forceMu.Lock()
+	defer t.forceMu.Unlock()
+
+	m := t.meta.GetSegmentsChanPart(func(segment *SegmentInfo) bool {
+		return (signal.collectionID == 0 || segment.CollectionID == signal.collectionID) &&
+			isSegmentHealthy(segment) &&
+			isFlush(segment) &&
+			!segment.isCompacting && // not compacting now
+			!segment.GetIsImporting() && // not importing now
+			lo.Contains(segmentIDs, segment.ID)
+	}) // m is list of chanPartSegments, which is channel-partition organized segments
+
+	if len(m) == 0 || len(m[0].segments) != len(segmentIDs) {
+		return -1, errors.Newf("no partition or segments not in the same partition or shard: %v", segmentIDs)
+	}
+
+	ts, err := t.allocTs()
+	if err != nil {
+		log.Warn("allocate ts failed, skip to handle compaction",
+			zap.Int64("collectionID", signal.collectionID),
+			zap.Int64("partitionID", signal.partitionID),
+			zap.Int64("segmentID", signal.segmentID))
+		return -1, err
+	}
+
+	for _, group := range m {
+		pv := GetPartitionView(group.partitionID, group.segments)
+		log.Info("compaction distributions before compaction", zap.String("distribution", pv.String()))
+	}
+	for _, group := range m {
+		_, err := t.updateSegmentMaxSize(group.segments)
+		if err != nil {
+			log.Warn("failed to update segment max size", zap.Error(err))
+			continue
+		}
+
+		ct, err := t.getCompactTime(ts, group.collectionID)
+		if err != nil {
+			log.Warn("get compact time failed, skip to handle compaction",
+				zap.Int64("collectionID", group.collectionID),
+				zap.Int64("partitionID", group.partitionID),
+				zap.String("channel", group.channelName))
+			return -1, err
+		}
+
+		plan := segmentsToPlan(group.segments, ct)
+		segIDs := fetchSegIDs(plan.GetSegmentBinlogs())
+
+		start := time.Now()
+		if err := t.fillOriginPlan(plan); err != nil {
+			log.Warn("failed to fill plan",
+				zap.Int64s("segment IDs", segIDs),
+				zap.Error(err))
+			continue
+		}
+		err = t.compactionHandler.execCompactionPlan(signal, plan)
+		if err != nil {
+			log.Warn("failed to execute compaction plan",
+				zap.Int64("collection", signal.collectionID),
+				zap.Int64("planID", plan.PlanID),
+				zap.Int64s("segment IDs", segIDs),
+				zap.Error(err))
+			continue
+		}
+
+		segIDMap := make(map[int64][]*datapb.FieldBinlog, len(plan.SegmentBinlogs))
+		for _, seg := range plan.SegmentBinlogs {
+			segIDMap[seg.SegmentID] = seg.Deltalogs
+		}
+
+		log.Info("time cost of generating forced segment compaction",
+			zap.Any("segID2DeltaLogs", segIDMap),
+			zap.Int64("planID", plan.PlanID),
+			zap.Any("time cost", time.Since(start).Milliseconds()),
+			zap.Int64("collectionID", signal.collectionID),
+			zap.String("channel", group.channelName),
+			zap.Int64("partitionID", group.partitionID),
+			zap.Int64s("segment IDs", segIDs))
+	}
+
+	return id, nil
+}
+
 // triggerSingleCompaction triger a compaction bundled with collection-partition-channel-segment
 func (t *compactionTrigger) triggerSingleCompaction(collectionID, partitionID, segmentID int64, channel string) error {
 	// If AutoCompaction disabled, flush request will not trigger compaction
@@ -348,6 +448,11 @@ func (t *compactionTrigger) handleGlobalSignal(signal *compactionSignal) {
 			!segment.GetIsImporting() // not importing now
 	}) // m is list of chanPartSegments, which is channel-partition organized segments
 
+	for _, group := range m {
+		pv := GetPartitionView(group.partitionID, group.segments)
+		log.Info("YX distribution", zap.String("distribution", pv.String()))
+	}
+
 	if len(m) == 0 {
 		return
 	}
@@ -464,6 +569,9 @@ func (t *compactionTrigger) handleSignal(signal *compactionSignal) {
 	partitionID := segment.GetPartitionID()
 	collectionID := segment.GetCollectionID()
 	segments := t.getCandidateSegments(channel, partitionID)
+
+	pv := GetPartitionView(partitionID, segments)
+	log.Info("YX distribution", zap.String("distribution", pv.String()))
 
 	if len(segments) == 0 {
 		return
@@ -908,4 +1016,115 @@ func fetchSegIDs(segBinLogs []*datapb.CompactionSegmentBinlogs) []int64 {
 		segIDs = append(segIDs, segBinLog.GetSegmentID())
 	}
 	return segIDs
+}
+
+// TODO GOOSE
+func (t *compactionTrigger) generatePlansV2(view partitionView, force bool, isDiskIndex bool, compactTime *compactTime) []*datapb.CompactionPlan {
+	// calculate if distribution needs update, if so
+	// Calculate next partition distribution
+	// If has cache:
+	//      if next partition distribution equals to cache && cache enough time, submit the plan
+	//      update cache if distribution != cache
+	// If score < 90% && no cache: cache
+	// If score >= 90%, submit the plan
+	return nil // TODO remove
+}
+
+// distribution of segments in partition level
+// distribution is sorted by segment size
+type partitionView struct {
+	partitionID  UniqueID
+	size         int64
+	distribution []segmentView
+}
+
+// TODO GOOSE Sorted
+func GetPartitionView(partitionID UniqueID, segments []*SegmentInfo) *partitionView {
+	pv := partitionView{
+		partitionID:  partitionID,
+		distribution: make([]segmentView, 0),
+	}
+
+	for _, seg := range segments {
+		sv := segmentView{
+			segmentID: seg.GetID(),
+			size:      int64((int64(Params.DataCoordCfg.SegmentMaxSize.GetAsFloat()*1024*1024) * seg.GetNumOfRows()) / seg.GetMaxRowNum()),
+		}
+		pv.distribution = append(pv.distribution, sv)
+		pv.size += sv.size
+	}
+	sort.Sort(&pv)
+	return &pv
+}
+
+func (v *partitionView) Next() {
+	maxSize := Params.DataCoordCfg.SegmentMaxSize.GetAsFloat() * 1024 * 1024
+	var threshold int = len(v.distribution)
+	for idx := range v.distribution {
+		if v.distribution[idx].size < int64(maxSize*0.9) {
+			threshold = idx
+			break
+		}
+	}
+
+	if len(v.distribution[threshold:]) >= 2 {
+		var (
+			next    []segmentView = v.distribution[:threshold]
+			tmpSize float32
+		)
+		for idx := threshold; idx < len(v.distribution); idx++ {
+			currSize := float32(v.distribution[idx].size)
+			if tmpSize+currSize > 1.2*float32(maxSize) {
+				sv := segmentView{-1, int64(tmpSize), 0}
+				next = append(next, sv)
+
+				tmpSize = currSize
+				continue
+			}
+			tmpSize += currSize
+		}
+		if tmpSize > 0 {
+			sv := segmentView{-1, int64(tmpSize), 0}
+			next = append(next, sv)
+		}
+		v.distribution = next
+	}
+}
+
+func (v *partitionView) String() string {
+	var distStr []string
+	for _, segView := range v.distribution {
+		distStr = append(distStr, segView.String())
+	}
+
+	return fmt.Sprintf("Partition distribution: <paritionID: %d, size: %.2f, distribution: [%s]>", v.partitionID, float32(v.size)/(1024*1024), strings.Join(distStr, ","))
+}
+
+func (v *partitionView) Len() int {
+	return len(v.distribution)
+}
+
+// Sort in descending order
+func (v *partitionView) Less(i, j int) bool {
+	left := v.distribution[i].size
+	right := v.distribution[j].size
+	return left > right
+}
+
+func (v *partitionView) Swap(i, j int) {
+	v.distribution[i], v.distribution[j] = v.distribution[j], v.distribution[i]
+}
+
+type segmentView struct {
+	segmentID UniqueID
+	size      int64
+	deltaSize int64
+}
+
+func (v segmentView) String() string {
+	if v.deltaSize > 0 {
+		return fmt.Sprintf("<ID: %d, size: %.2f, deltaSize: %d>", v.segmentID, float32(v.size)/(1024*1024), v.deltaSize)
+	}
+
+	return fmt.Sprintf("<ID: %d, size: %.2f>", v.segmentID, float32(v.size)/(1024*1024))
 }

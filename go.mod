@@ -23,7 +23,6 @@ require (
 	github.com/milvus-io/milvus-proto/go-api v0.0.0-20230531124827-410c849303a9
 	github.com/milvus-io/milvus/pkg v0.0.0-00010101000000-000000000000
 	github.com/minio/minio-go/v7 v7.0.17
-	github.com/panjf2000/ants/v2 v2.7.2
 	github.com/prometheus/client_golang v1.14.0
 	github.com/quasilyte/go-ruleguard/dsl v0.3.21
 	github.com/samber/lo v1.27.0
@@ -60,6 +59,7 @@ require (
 	github.com/facebookgo/ensure v0.0.0-20200202191622-63f1cf65ac4c // indirect
 	github.com/facebookgo/stack v0.0.0-20160209184415-751773369052 // indirect
 	github.com/facebookgo/subset v0.0.0-20200203212716-c811ad88dec4 // indirect
+	github.com/panjf2000/ants/v2 v2.7.2 // indirect
 	github.com/pelletier/go-toml/v2 v2.0.6 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	go.uber.org/automaxprocs v1.4.0 // indirect
@@ -218,3 +218,5 @@ replace (
 )
 
 exclude github.com/apache/pulsar-client-go/oauth2 v0.0.0-20211108044248-fe3b7c4e445b
+
+replace github.com/milvus-io/milvus-proto/go-api => github.com/xuanyang-cn/milvus-proto/go-api v0.0.0-20230605115720-ce553a8d01b0
