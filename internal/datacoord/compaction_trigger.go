@@ -19,6 +19,7 @@ package datacoord
 import (
 	"context"
 	"fmt"
+	"github.com/cockroachdb/errors"
 	"sort"
 	"strings"
 	"sync"
@@ -50,6 +51,7 @@ type trigger interface {
 	triggerSingleCompaction(collectionID, partitionID, segmentID int64, channel string) error
 	// forceTriggerCompaction force to start a compaction
 	forceTriggerCompaction(collectionID int64) (UniqueID, error)
+	triggerManualCompaction(collectionID int64, segmentIDs []int64) (int64, error)
 }
 
 type compactionSignal struct {
@@ -227,6 +229,112 @@ func (t *compactionTrigger) triggerCompaction() error {
 	}
 	t.signals <- signal
 	return nil
+}
+
+func (t *compactionTrigger) triggerManualCompaction(collectionID int64, segmentIDs []int64) (int64, error) {
+	id, err := t.allocSignalID()
+	if err != nil {
+		return -1, err
+	}
+	signal := &compactionSignal{
+		id:           id,
+		collectionID: collectionID,
+		isForce:      true,
+		isGlobal:     true,
+	}
+
+	log := log.With(zap.Int64("YX collectionID", collectionID))
+
+	t.forceMu.Lock()
+	defer t.forceMu.Unlock()
+
+	m := t.meta.GetSegmentsChanPart(func(segment *SegmentInfo) bool {
+		return (signal.collectionID == 0 || segment.CollectionID == signal.collectionID) &&
+			isSegmentHealthy(segment) &&
+			isFlush(segment) &&
+			!segment.isCompacting && // not compacting now
+			!segment.GetIsImporting() && // not importing now
+			lo.Contains(segmentIDs, segment.ID)
+	}) // m is list of chanPartSegments, which is channel-partition organized segments
+
+	if len(m) == 0 || len(m[0].segments) != len(segmentIDs) {
+		return -1, errors.Newf("no partition or segments not in the same partition or shard: %v", segmentIDs)
+	}
+
+	ts, err := t.allocTs()
+	if err != nil {
+		log.Warn("allocate ts failed, skip to handle compaction",
+			zap.Int64("collectionID", signal.collectionID),
+			zap.Int64("partitionID", signal.partitionID),
+			zap.Int64("segmentID", signal.segmentID))
+		return -1, err
+	}
+
+	coll, err := t.getCollection(collectionID)
+	if err != nil {
+		log.Warn("get collection info failed, skip handling compaction",
+			zap.Int64("collectionID", collectionID),
+			zap.Error(err),
+		)
+		return -1, errors.Newf("get collection info failed, skip handling compaction, %d", collectionID)
+	}
+
+	for _, group := range m {
+		pv := GetPartitionView(group.partitionID, group.segments)
+		log.Info("compaction distributions before compaction", zap.String("distribution", pv.String()))
+	}
+	for _, group := range m {
+		_, err := t.updateSegmentMaxSize(group.segments)
+		if err != nil {
+			log.Warn("failed to update segment max size", zap.Error(err))
+			continue
+		}
+
+		ct, err := t.getCompactTime(ts, coll)
+		if err != nil {
+			log.Warn("get compact time failed, skip to handle compaction",
+				zap.Int64("collectionID", group.collectionID),
+				zap.Int64("partitionID", group.partitionID),
+				zap.String("channel", group.channelName))
+			return -1, err
+		}
+
+		plan := segmentsToPlan(group.segments, ct)
+		segIDs := fetchSegIDs(plan.GetSegmentBinlogs())
+
+		start := time.Now()
+		if err := t.fillOriginPlan(plan); err != nil {
+			log.Warn("failed to fill plan",
+				zap.Int64s("segment IDs", segIDs),
+				zap.Error(err))
+			continue
+		}
+		err = t.compactionHandler.execCompactionPlan(signal, plan)
+		if err != nil {
+			log.Warn("failed to execute compaction plan",
+				zap.Int64("collection", signal.collectionID),
+				zap.Int64("planID", plan.PlanID),
+				zap.Int64s("segment IDs", segIDs),
+				zap.Error(err))
+			continue
+		}
+
+		segIDMap := make(map[int64][]*datapb.FieldBinlog, len(plan.SegmentBinlogs))
+		for _, seg := range plan.SegmentBinlogs {
+			segIDMap[seg.SegmentID] = seg.Deltalogs
+		}
+
+		log.Info("time cost of generating forced segment compaction",
+			zap.Any("segID2DeltaLogs", segIDMap),
+			zap.Int64("planID", plan.PlanID),
+			zap.Any("time cost", time.Since(start).Milliseconds()),
+			zap.Int64("collectionID", signal.collectionID),
+			zap.String("channel", group.channelName),
+			zap.Int64("partitionID", group.partitionID),
+			zap.Int64s("segment IDs", segIDs))
+	}
+
+	return id, nil
 }
 
 // triggerSingleCompaction triger a compaction bundled with collection-partition-channel-segment
