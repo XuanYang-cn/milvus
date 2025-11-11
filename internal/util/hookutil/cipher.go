@@ -118,11 +118,25 @@ func GetEzByCollProperties(collProperties []*commonpb.KeyValuePair, collectionID
 // GetStoragePluginContext returns the local plugin context for RPC from datacoord to datanode
 func GetStoragePluginContext(properties []*commonpb.KeyValuePair, collectionID int64) []*commonpb.KeyValuePair {
 	if GetCipher() == nil {
+		log.Debug("GetStoragePluginContext: cipher plugin is nil")
 		return nil
 	}
 
 	if ez := GetEzByCollProperties(properties, collectionID); ez != nil {
+		log.Info("GetStoragePluginContext: calling GetUnsafeKey",
+			zap.Int64("ezID", ez.EzID),
+			zap.Int64("collectionID", ez.CollectionID))
 		key := GetCipher().GetUnsafeKey(ez.EzID, ez.CollectionID)
+		if key == nil || len(key) == 0 {
+			log.Error("GetStoragePluginContext: GetUnsafeKey returned empty key - THIS WILL CAUSE COMPACTION TO FAIL",
+				zap.Int64("ezID", ez.EzID),
+				zap.Int64("collectionID", ez.CollectionID))
+			return nil
+		}
+		log.Info("GetStoragePluginContext: got encryption key successfully",
+			zap.Int64("ezID", ez.EzID),
+			zap.Int64("collectionID", ez.CollectionID),
+			zap.Int("keyLen", len(key)))
 		pluginContext := []*commonpb.KeyValuePair{
 			{
 				Key:   CipherConfigCreateEZ,
@@ -136,6 +150,8 @@ func GetStoragePluginContext(properties []*commonpb.KeyValuePair, collectionID i
 		return pluginContext
 	}
 
+	log.Debug("GetStoragePluginContext: no encryption zone found in properties",
+		zap.Int64("collectionID", collectionID))
 	return nil
 }
 
@@ -180,8 +196,11 @@ func RemoveEZByDBProperties(dbProperties []*commonpb.KeyValuePair) error {
 
 func CreateLocalEZByPluginContext(context []*commonpb.KeyValuePair) (*indexcgopb.StoragePluginContext, error) {
 	if GetCipher() == nil {
+		log.Debug("CreateLocalEZByPluginContext: cipher plugin is nil")
 		return nil, nil
 	}
+	log.Info("CreateLocalEZByPluginContext: received plugin context",
+		zap.Int("contextLen", len(context)))
 	config := make(map[string]string)
 	ctx := &indexcgopb.StoragePluginContext{}
 	for _, value := range context {
@@ -190,17 +209,40 @@ func CreateLocalEZByPluginContext(context []*commonpb.KeyValuePair) (*indexcgopb
 			if err != nil {
 				return nil, err
 			}
+			log.Info("CreateLocalEZByPluginContext: found ezID",
+				zap.Int64("ezID", ezID))
 			config[CipherConfigCreateEZ] = value.GetValue()
 			ctx.EncryptionZoneId = ezID
 		}
 		if value.GetKey() == CipherConfigUnsafeEZK {
+			log.Info("CreateLocalEZByPluginContext: found encryption key",
+				zap.Int("keyLen", len(value.GetValue())))
 			config[CipherConfigUnsafeEZK] = value.GetValue()
 			ctx.EncryptionKey = value.GetValue()
 		}
 	}
 	if len(config) == 2 {
-		return ctx, GetCipher().Init(config)
+		if config[CipherConfigUnsafeEZK] == "" {
+			log.Error("CreateLocalEZByPluginContext: CRITICAL - received empty encryption key",
+				zap.String("ezID", config[CipherConfigCreateEZ]))
+			return nil, fmt.Errorf("empty encryption key for ezID %s", config[CipherConfigCreateEZ])
+		}
+		log.Info("CreateLocalEZByPluginContext: cache new encryption key",
+			zap.String("ezID", config[CipherConfigCreateEZ]),
+			zap.Int("keyLen", len(config[CipherConfigUnsafeEZK])))
+		err := GetCipher().Init(config)
+		if err != nil {
+			log.Error("CreateLocalEZByPluginContext: Init failed",
+				zap.String("ezID", config[CipherConfigCreateEZ]),
+				zap.Error(err))
+			return nil, err
+		}
+		log.Info("CreateLocalEZByPluginContext: successfully initialized local key manager")
+		return ctx, nil
 	}
+	log.Warn("CreateLocalEZByPluginContext: incomplete config",
+		zap.Int("configLen", len(config)),
+		zap.Any("configKeys", lo.Keys(config)))
 	return nil, nil
 }
 
