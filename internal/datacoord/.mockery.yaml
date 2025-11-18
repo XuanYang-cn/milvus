@@ -32,6 +32,7 @@ packages:
       ChannelManager:
       SubCluster:
       StatsJobManager:
+      CollectionTopologyQuerier:
   github.com/milvus-io/milvus/internal/datacoord/allocator:
     interfaces:
       Allocator:
