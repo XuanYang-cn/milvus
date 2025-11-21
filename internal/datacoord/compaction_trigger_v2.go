@@ -678,13 +678,10 @@ func (m *CompactionTriggerManager) SubmitForceMergeViewToScheduler(ctx context.C
 		return
 	}
 
-	var totalRows int64
-	for _, s := range view.GetSegmentsView() {
-		totalRows += s.NumOfRows
-	}
+	totalRows := lo.SumBy(view.GetSegmentsView(), func(v *SegmentView) int64 { return v.NumOfRows })
 
-	// TODO
-	n := 11 * paramtable.Get().DataCoordCfg.CompactionPreAllocateIDExpansionFactor.GetAsInt64()
+	targetCount := view.(*ForceMergeSegmentView).targetCount
+	n := targetCount * paramtable.Get().DataCoordCfg.CompactionPreAllocateIDExpansionFactor.GetAsInt64()
 	startID, endID, err := m.allocator.AllocN(n)
 	if err != nil {
 		log.Warn("Failed to submit compaction view to scheduler because allocate id fail", zap.Error(err))
@@ -706,7 +703,7 @@ func (m *CompactionTriggerManager) SubmitForceMergeViewToScheduler(ctx context.C
 		ResultSegments:     []int64{},
 		TotalRows:          totalRows,
 		LastStateStartTime: time.Now().Unix(),
-		MaxSize:            view.(*ForceMergeSegmentView).targetSize,
+		MaxSize:            int64(view.(*ForceMergeSegmentView).targetSize),
 		PreAllocatedSegmentIDs: &datapb.IDRange{
 			Begin: startID + 1,
 			End:   endID,

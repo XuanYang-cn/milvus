@@ -21,9 +21,6 @@ import (
 )
 
 const (
-	datanodeMemoryFactor  = 3.0
-	querynodeMemoryFactor = 2.5
-
 	// Fallback memory for pooling DataNode (returns 0 from GetMetrics)
 	defaultPoolingDataNodeMemory = 32 * 1024 * 1024 * 1024 // 32GB
 )
@@ -115,7 +112,7 @@ func (policy *forceMergeCompactionPolicy) triggerOneCollection(
 			triggerID:     triggerID,
 			collectionTTL: collectionTTL,
 
-			configMaxSize: configMaxSize,
+			configMaxSize: float64(configMaxSize),
 			topology:      topology,
 		}
 		views = append(views, view)

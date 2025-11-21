@@ -38,10 +38,10 @@ type ForceMergeSegmentView struct {
 	triggerID     int64
 	collectionTTL time.Duration
 
-	configMaxSize int64
+	configMaxSize float64
 	topology      *CollectionTopology
 
-	targetSize  int64
+	targetSize  float64
 	targetCount int64
 }
 
@@ -74,29 +74,25 @@ func (v *ForceMergeSegmentView) GetTriggerID() int64 {
 	return v.triggerID
 }
 
-func (v *ForceMergeSegmentView) ForceTriggerAll() ([]CompactionView, string) {
+func (v *ForceMergeSegmentView) calculateTargetSizeCount() (maxSafeSize float64, targetCount int64) {
 	log := log.With(zap.Int64("triggerID", v.triggerID), zap.String("label", v.label.String()))
-	totalSize := sumSegmentSize(v.segments)
-
-	targetCount, maxSafeSize := v.calculateTargetSegmentCount(totalSize)
-
-	// Calculate target size per segment
-	targetSizePerSegment := int64(totalSize / float64(targetCount))
-
-	targetSizePerSegment = max(targetSizePerSegment, v.configMaxSize)
-	targetSizePerSegment = min(targetSizePerSegment, maxSafeSize)
-
-	// If we violate max safe size, recalculate target count
-	if int64(totalSize/float64(targetCount)) > maxSafeSize {
-		targetCount = max(1, int(totalSize/float64(maxSafeSize)))
+	maxSafeSize = v.calculateMaxSafeSize()
+	if maxSafeSize < v.configMaxSize {
+		log.Info("maxSafeSize is less than configMaxSize, set to configMaxSize",
+			zap.Float64("targetSize", maxSafeSize),
+			zap.Float64("configMaxSize", v.configMaxSize))
+		maxSafeSize = v.configMaxSize
 	}
 
+	targetCount = max(1, int64(sumSegmentSize(v.segments)/maxSafeSize))
 	log.Info("topology-aware force merge calculation",
-		zap.Int("targetSegmentCount", targetCount),
-		zap.Int64("targetSizePerSegment", targetSizePerSegment),
-		zap.Int64("maxSafeSize", maxSafeSize))
+		zap.Int64("targetSegmentCount", targetCount),
+		zap.Float64("maxSafeSize", maxSafeSize))
+	return maxSafeSize, targetCount
+}
 
-	// Use adaptive grouping based on segment count
+func (v *ForceMergeSegmentView) ForceTriggerAll() ([]CompactionView, string) {
+	targetSizePerSegment, targetCount := v.calculateTargetSizeCount()
 	groups := adaptiveGroupSegments(v.segments, float64(targetSizePerSegment))
 
 	results := make([]CompactionView, 0, len(groups))
@@ -108,7 +104,7 @@ func (v *ForceMergeSegmentView) ForceTriggerAll() ([]CompactionView, string) {
 			collectionTTL: v.collectionTTL,
 			configMaxSize: v.configMaxSize,
 			targetSize:    targetSizePerSegment,
-			targetCount:   int64(targetCount),
+			targetCount:   targetCount,
 			topology:      v.topology,
 		})
 	}
@@ -274,86 +270,38 @@ func maxFullSegmentsGrouping(segments []*SegmentView, targetSize float64) [][]*S
 	return groups
 }
 
-func (v *ForceMergeSegmentView) calculateTargetSegmentCount(totalSize float64) (targetCount int, maxSafeSize int64) {
-	log := log.With(zap.String("label", v.label.String()))
-
-	// 1. Count total QueryNodes and get minimum memory
-	numQNs := len(v.topology.QueryNodeMemory)
-	if numQNs == 0 {
-		// TODO
-		// log.Warn("no QueryNodes found, using segment count as target")
-		// return len(v.segments), math.MaxInt64
+func (v *ForceMergeSegmentView) calculateMaxSafeSize() float64 {
+	log := log.With(zap.Int64("triggerID", v.triggerID), zap.String("label", v.label.String()))
+	if len(v.topology.QueryNodeMemory) == 0 || len(v.topology.DataNodeMemory) == 0 {
+		log.Warn("No querynodes or datanodes in topology, using config size")
+		return v.configMaxSize
 	}
 
-	// 2. Calculate memory constraints
-	// 2a. QueryNode constraint: use global minimum memory
-	var minQNMemory uint64 = math.MaxUint64
-	for _, mem := range v.topology.QueryNodeMemory {
-		if mem > 0 && mem < minQNMemory {
-			minQNMemory = mem
-		}
-	}
-	if minQNMemory == math.MaxUint64 {
-		// TODO
-		// log.Warn("no valid QueryNode memory found")
-		// return len(segments), math.MaxInt64
-	}
-	qnMaxSafeSize := int64(float64(minQNMemory) / querynodeMemoryFactor)
+	// QueryNode constraint: use global minimum memory
+	querynodeMemoryFactor := paramtable.Get().DataCoordCfg.CompactionForceMergeQueryNodeMemoryFactor.GetAsFloat()
+	qnMaxSafeSize := float64(lo.Min(lo.Values(v.topology.QueryNodeMemory))) / querynodeMemoryFactor
 
-	// 2b. DataNode constraint: segments must fit in smallest DataNode
-	// DataNodes do the compaction work!
-	minDNMemory := uint64(^uint64(0)) // math.MaxUint64
-	for _, mem := range v.topology.DataNodeMemory {
-		if mem > 0 && mem < minDNMemory {
-			minDNMemory = mem
-		}
-	}
-	dnMaxSafeSize := int64(float64(minDNMemory) / datanodeMemoryFactor)
+	// DataNode constraint: segments must fit in smallest DataNode
+	datanodeMemoryFactor := paramtable.Get().DataCoordCfg.CompactionForceMergeDataNodeMemoryFactor.GetAsFloat()
+	dnMaxSafeSize := float64(lo.Min(lo.Values(v.topology.DataNodeMemory))) / datanodeMemoryFactor
 
-	// 2c. Special handling for standalone mode
-	// In standalone mode, QueryNode and DataNode share the same process/memory
-	if v.topology.IsStandaloneMode {
-		// In standalone: QN and DN are co-located
-		// Use more conservative constraint to avoid OOM
-		// The memory must support BOTH query load and compaction load
-		sharedMaxSafeSize := int64(float64(minQNMemory) / (querynodeMemoryFactor + datanodeMemoryFactor))
-		maxSafeSize = sharedMaxSafeSize
-
-		log.Debug("standalone mode: using shared memory constraint",
-			zap.Int64("sharedMaxSafeSize", sharedMaxSafeSize),
-			zap.Uint64("minQNMemory", minQNMemory))
-	} else {
-		// In cluster mode: take the more restrictive constraint
-		maxSafeSize = min(qnMaxSafeSize, dnMaxSafeSize)
-
-		log.Debug("cluster mode: using separate memory constraints",
-			zap.Int64("qnMaxSafeSize", qnMaxSafeSize),
-			zap.Int64("dnMaxSafeSize", dnMaxSafeSize),
-			zap.Int64("maxSafeSize", maxSafeSize))
+	maxSafeSize := min(qnMaxSafeSize, dnMaxSafeSize)
+	if v.topology.IsStandaloneMode && !v.topology.IsPooling {
+		log.Info("force merge on standalone not pooling mode, half the max size",
+			zap.Float64("qnMaxSafeSize", qnMaxSafeSize),
+			zap.Float64("dnMaxSafeSize", dnMaxSafeSize),
+			zap.Float64("maxSafeSize", maxSafeSize),
+			zap.Float64("configMaxSize", v.configMaxSize))
+		// dn and qn are co-located, half the min
+		return maxSafeSize * 0.5
 	}
 
-	// 3. Target: use number of replicas × QueryNodes as heuristic
-	// For force merge, we want to balance across replicas
-	targetCount = v.topology.NumReplicas * numQNs
-
-	// But don't create more segments than we have
-	targetCount = min(targetCount, len(v.segments))
-
-	// 4. Check if segments would be too small
-	minSegmentSize := maxSafeSize / 10 // heuristic: at least 10% of maxSafeSize
-	if totalSize/float64(targetCount) < float64(minSegmentSize) {
-		targetCount = max(1, int(totalSize/float64(minSegmentSize)))
-		log.Debug("adjusted target count to avoid too small segments",
-			zap.Int("adjustedTargetCount", targetCount),
-			zap.Int64("minSegmentSize", minSegmentSize))
-	}
-
-	log.Info("calculated target segment count for group",
-		zap.Int("targetCount", targetCount),
-		zap.Int64("maxSafeSize", maxSafeSize),
-		zap.Any("topology", v.topology))
-
-	return targetCount, maxSafeSize
+	log.Info("force merge on cluster/pooling mode",
+		zap.Float64("qnMaxSafeSize", qnMaxSafeSize),
+		zap.Float64("dnMaxSafeSize", dnMaxSafeSize),
+		zap.Float64("maxSafeSize", maxSafeSize),
+		zap.Float64("configMaxSize", v.configMaxSize))
+	return maxSafeSize
 }
 
 func sumSegmentSize(views []*SegmentView) float64 {
