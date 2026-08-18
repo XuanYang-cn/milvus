@@ -289,6 +289,22 @@ type sortKeyCol struct {
 	str  *array.String
 }
 
+// mergeReaderState owns all mutable state associated with one input reader.
+// Keeping it together avoids a collection of reader-count-sized allocations
+// and makes record advancement reset the whole borrowed-record state in one
+// place.
+type mergeReaderState struct {
+	rec                     Record
+	keys                    []sortKeyCol
+	pos                     int32
+	recNo                   int32
+	prepared                preparedRecordAppender
+	preparedReady           bool
+	selection               []uint8
+	allPredicatesKept       bool
+	recordPredicateComplete bool
+}
+
 // radixSortByInt64 sorts indices in place so that keys[indices[k].ri][indices[k].i]
 // is non-decreasing, using a stable LSD radix sort over the 8 bytes of the int64
 // key (O(N)). The sign bit is flipped so unsigned byte ordering matches signed
@@ -356,36 +372,27 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 	}
 
 	nk := len(sortedByFieldIDs)
-	recs := make([]Record, len(rr))
-	// keys[ri][fp] is the fp-th merge key column of the record reader ri holds.
-	// Allocated once and overwritten in place on every advance; recs[ri] == nil
-	// is the sole exhausted-reader sentinel. keys[ri] stays valid until
-	// seedNext(ri) advances that reader again -- not merely while ri has a heap
-	// entry: the main loop reads keys[ri] in compareWithLast and saveLast after
-	// popping ri's only entry. Moving either of those after seedNext would be a
-	// use-after-advance.
-	keys := make([][]sortKeyCol, len(rr))
-	for i := range keys {
-		keys[i] = make([]sortKeyCol, nk)
+	rb := NewRecordBuilder(schema)
+	defer rb.Release()
+	states := make([]mergeReaderState, len(rr))
+	for i := range states {
+		states[i].keys = make([]sortKeyCol, nk)
+		states[i].recNo = -1
 	}
-	// pos[ri] is the next row of that record to consider.
-	pos := make([]int32, len(rr))
-	// recNo[ri] counts the records that reader has produced. It turns an
-	// out-of-order row into a (record, row) coordinate, since pos -- and so
-	// idx.i -- restarts at zero on every record.
-	recNo := make([]int32, len(rr))
-	for i := range recNo {
-		recNo[i] = -1
-	}
+	// states[ri].keys[fp] is the fp-th merge key column held by reader ri.
+	// It is allocated once and overwritten in place on every record advance;
+	// states[ri].rec == nil is the sole exhausted-reader sentinel. The keys stay
+	// valid until seedNext(ri) advances that reader again, not merely while ri
+	// has a heap entry: the main loop reads them after popping ri's only entry.
 
 	extractKeys := func(ri int) error {
-		cols := keys[ri]
+		state := &states[ri]
 		for fp, fid := range sortedByFieldIDs {
-			switch a := recs[ri].Column(fid).(type) {
+			switch a := state.rec.Column(fid).(type) {
 			case *array.Int64:
-				cols[fp] = sortKeyCol{kind: keyInt64, i64: a.Int64Values()}
+				state.keys[fp] = sortKeyCol{kind: keyInt64, i64: a.Int64Values()}
 			case *array.String:
-				cols[fp] = sortKeyCol{kind: keyString, str: a}
+				state.keys[fp] = sortKeyCol{kind: keyString, str: a}
 			default:
 				return merr.WrapErrStorageMsg("unsupported type for sorting key")
 			}
@@ -394,14 +401,80 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 	}
 
 	advanceRecord := func(ri int) error {
+		state := &states[ri]
 		rec, err := rr[ri].Next()
-		recs[ri] = rec // assign nil if err
+		state.rec = rec // assign nil if err
+		state.selection = nil
+		state.allPredicatesKept = true
+		state.recordPredicateComplete = false
+		state.preparedReady = false
 		if err != nil {
 			return err
 		}
-		pos[ri] = 0
-		recNo[ri]++
+		state.pos = 0
+		state.recNo++
 		return extractKeys(ri)
+	}
+
+	ensurePrepared := func(ri int) error {
+		state := &states[ri]
+		if state.preparedReady {
+			return nil
+		}
+		if state.prepared.fields == nil {
+			state.prepared.fields = make([]preparedValueAppender, len(rb.builders))
+		}
+		if err := rb.prepareRecord(state.rec, &state.prepared); err != nil {
+			return err
+		}
+		state.preparedReady = true
+		return nil
+	}
+
+	// startSelectionCache is paid only when run lookahead or direct-forward
+	// proof needs to revisit predicate results. The one-row interleaved path
+	// evaluates predicates directly and therefore keeps the allocation profile
+	// of the original k-way merge.
+	startSelectionCache := func(ri int) {
+		state := &states[ri]
+		if state.selection != nil {
+			return
+		}
+		state.selection = make([]uint8, state.rec.Len())
+		// Rows before pos and the row at pos have already been evaluated. If no
+		// drop has been seen, they are all known-kept and can be recorded without
+		// invoking the predicate again. After a drop, only the current seeded row
+		// needs to be cached; earlier rows can never participate in this run or a
+		// keep-all forwarding proof.
+		if state.allPredicatesKept {
+			for i := 0; i <= int(state.pos); i++ {
+				state.selection[i] = 1
+			}
+		} else {
+			state.selection[state.pos] = 1
+		}
+	}
+
+	rowKept := func(ri, i int) bool {
+		readerState := &states[ri]
+		if readerState.selection == nil {
+			kept := predicate(readerState.rec, ri, i)
+			if !kept {
+				readerState.allPredicatesKept = false
+			}
+			return kept
+		}
+		state := readerState.selection[i]
+		if state == 0 {
+			if predicate(readerState.rec, ri, i) {
+				state = 1
+			} else {
+				state = 2
+				readerState.allPredicatesKept = false
+			}
+			readerState.selection[i] = state
+		}
+		return state == 1
 	}
 
 	// compareKeys orders two rows that are both currently live in the heap.
@@ -409,7 +482,7 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 	// every comparison.
 	compareKeys := func(x, y rowIndex) int {
 		for fp := 0; fp < nk; fp++ {
-			cx, cy := &keys[x.ri][fp], &keys[y.ri][fp]
+			cx, cy := &states[x.ri].keys[fp], &states[y.ri].keys[fp]
 			switch cx.kind {
 			case keyInt64:
 				xv, yv := cx.i64[x.i], cy.i64[y.i]
@@ -449,19 +522,18 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 	}
 
 	// seedNext pushes reader ri's next qualifying row, advancing across records
-	// as needed. Every (record, row) position is evaluated by predicate exactly
-	// once: pos only moves forward within a record, and is reset only when
-	// advanceRecord installs a new one.
+	// as needed. It evaluates directly until a run starts a lazy result cache;
+	// either way every original row is evaluated exactly once.
 	seedNext := func(ri int) error {
-		for recs[ri] != nil {
-			r := recs[ri]
-			for int(pos[ri]) < r.Len() {
-				i := pos[ri]
-				if predicate(r, ri, int(i)) {
+		state := &states[ri]
+		for state.rec != nil {
+			for int(state.pos) < state.rec.Len() {
+				i := state.pos
+				if rowKept(ri, int(i)) {
 					h.push(rowIndex{ri: int32(ri), i: i})
 					return nil
 				}
-				pos[ri]++
+				state.pos++
 			}
 			if err := advanceRecord(ri); err != nil {
 				if err == io.EOF {
@@ -485,7 +557,6 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 		}
 	}
 
-	rb := NewRecordBuilder(schema)
 	writeRecord := func() error {
 		rec := rb.Build()
 		defer rec.Release()
@@ -510,7 +581,7 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 
 	compareWithLast := func(x rowIndex) int {
 		for fp := 0; fp < nk; fp++ {
-			cx := &keys[x.ri][fp]
+			cx := &states[x.ri].keys[fp]
 			switch cx.kind {
 			case keyInt64:
 				xv := cx.i64[x.i]
@@ -535,7 +606,7 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 
 	saveLast := func(x rowIndex) {
 		for fp := 0; fp < nk; fp++ {
-			cx := &keys[x.ri][fp]
+			cx := &states[x.ri].keys[fp]
 			switch cx.kind {
 			case keyInt64:
 				lastI64[fp] = cx.i64[x.i]
@@ -546,32 +617,129 @@ func MergeSort(batchSize uint64, schema *schemapb.CollectionSchema, rr []RecordR
 		hasLast = true
 	}
 
-	for h.len() > 0 {
-		idx := h.pop()
-
+	emitRow := func(idx rowIndex) error {
 		if hasLast && compareWithLast(idx) < 0 {
-			return 0, merr.WrapErrDataIntegrityMsg(
+			return merr.WrapErrDataIntegrityMsg(
 				"input record is not sorted by the merge key: reader %d record %d row %d out of order, merge key fields %v",
-				idx.ri, recNo[idx.ri], idx.i, sortedByFieldIDs)
+				idx.ri, states[idx.ri].recNo, idx.i, sortedByFieldIDs)
 		}
 		saveLast(idx)
-
-		if err := rb.Append(recs[idx.ri], int(idx.i), int(idx.i)+1); err != nil {
-			return 0, err
+		if err := ensurePrepared(int(idx.ri)); err != nil {
+			return err
+		}
+		if err := rb.appendPreparedRow(&states[idx.ri].prepared, int(idx.i)); err != nil {
+			return err
 		}
 		numRows++
-
-		// Due to current arrow impl (v12), the write performance is largely dependent on the batch size,
-		//	small batch size will cause write performance degradation. To work around this issue, we accumulate
-		//	records and write them in batches. This requires additional memory copy.
 		if rb.GetSize() >= batchSize {
-			if err := writeRecord(); err != nil {
-				return 0, err
+			return writeRecord()
+		}
+		return nil
+	}
+
+	emitRun := func(ri int) error {
+		state := &states[ri]
+		if state.rec == nil {
+			return nil
+		}
+		r := state.rec
+		start := int(state.pos)
+		if start >= r.Len() {
+			return seedNext(ri)
+		}
+		startSelectionCache(ri)
+		end := start + 1
+		for end < r.Len() && rowKept(ri, end) {
+			candidate := rowIndex{ri: int32(ri), i: int32(end)}
+			if h.len() > 0 && !h.less(candidate, h.items[0]) {
+				break
+			}
+			end++
+		}
+		// Direct forwarding may bypass per-row reconstruction, never the
+		// predicate contract. Only pay for the full-record keep-all proof when
+		// this interval and record shape could actually use the fast path.
+		forwardCandidate := end-start >= directForwardMinRows && rb.canDirectForwardRecord(r)
+		if forwardCandidate && state.allPredicatesKept && !state.recordPredicateComplete {
+			// Rows before start were already evaluated while seeding the heap and
+			// are known kept because allPredicatesKept is still true. The run
+			// lookahead has cached [start, end); continue only with rows not yet
+			// inspected so predicate remains exactly-once.
+			for i := end; i < r.Len(); i++ {
+				if !rowKept(ri, i) {
+					break
+				}
+			}
+			state.recordPredicateComplete = true
+		}
+		remaining := uint64(0)
+		if rb.GetSize() < batchSize {
+			remaining = batchSize - rb.GetSize()
+		}
+		forwarded, forwardedOK := (*simpleArrowRecord)(nil), false
+		// Keep a rebuilt batch intact.  Flushing it and issuing a second writer
+		// call for a forwarded slice can cross a MultiSegmentWriter rotation
+		// boundary and change output Segment partitioning.  Direct forwarding is
+		// therefore only selected at an empty output-batch boundary.
+		if rb.GetRowNum() != 0 {
+			forwardCandidate = false
+		}
+		if forwardCandidate && state.allPredicatesKept && state.recordPredicateComplete {
+			forwarded, forwardedOK = rb.directForwardRecord(r, start, end, remaining)
+		}
+		if forwardedOK {
+			for i := start; i < end; i++ {
+				candidate := rowIndex{ri: int32(ri), i: int32(i)}
+				if hasLast && compareWithLast(candidate) < 0 {
+					forwarded.Release()
+					return merr.WrapErrDataIntegrityMsg(
+						"input record is not sorted by the merge key: reader %d record %d row %d out of order, merge key fields %v",
+						candidate.ri, state.recNo, candidate.i, sortedByFieldIDs)
+				}
+				saveLast(candidate)
+			}
+			if rb.GetRowNum() > 0 {
+				if err := writeRecord(); err != nil {
+					forwarded.Release()
+					return err
+				}
+			}
+			if err := rw.Write(forwarded); err != nil {
+				forwarded.Release()
+				return err
+			}
+			forwarded.Release()
+			numRows += end - start
+			state.pos = int32(end)
+		} else {
+			if end-start > 1 {
+				rb.reservePrepared(end - start)
+			}
+			for i := start; i < end; i++ {
+				candidate := rowIndex{ri: int32(ri), i: int32(i)}
+				if err := emitRow(candidate); err != nil {
+					return err
+				}
+				state.pos++
 			}
 		}
 
-		pos[idx.ri]++
-		if err := seedNext(int(idx.ri)); err != nil {
+		if int(state.pos) < r.Len() {
+			return seedNext(ri)
+		}
+		if err := advanceRecord(ri); err != nil {
+			if err == io.EOF {
+				state.rec = nil
+				return nil
+			}
+			return err
+		}
+		return seedNext(ri)
+	}
+
+	for h.len() > 0 {
+		idx := h.pop()
+		if err := emitRun(int(idx.ri)); err != nil {
 			return 0, err
 		}
 	}

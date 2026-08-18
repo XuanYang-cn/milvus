@@ -1,12 +1,12 @@
 package compactor
 
 import (
+	"io"
 	"testing"
 
 	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/apache/arrow/go/v17/arrow/array"
 	"github.com/apache/arrow/go/v17/arrow/memory"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -53,7 +53,7 @@ func (r *materializerTestReader) Next() (storage.Record, error) {
 		r.current = nil
 	}
 	if r.idx >= len(r.records) {
-		return nil, errors.New("no more records")
+		return nil, io.EOF
 	}
 	record := r.records[r.idx]
 	r.idx++
@@ -572,6 +572,69 @@ func TestMaterializedRecordReaderReleasesPreviousRecordOnNextAndClose(t *testing
 	require.NoError(t, reader.Close())
 	require.Equal(t, 1, second.releaseCount)
 	require.True(t, base.closed)
+}
+
+func TestSelectedMaterializedRecordReaderFiltersBeforeMaterialization(t *testing.T) {
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+		{FieldID: 100, Name: "text", DataType: schemapb.DataType_VarChar},
+		{FieldID: 101, Name: "added", DataType: schemapb.DataType_Int64, Nullable: true},
+	}}
+	materializer, err := NewRecordMaterializer(schema, nil, map[int64]struct{}{100: {}})
+	require.NoError(t, err)
+	first := newStringArray(t, []string{"drop", "keep"})
+	defer first.Release()
+	record := &materializerTestRecord{len: 2, columns: map[storage.FieldID]arrow.Array{100: first}}
+	base := &materializerTestReader{records: []*materializerTestRecord{record}}
+	materializedRows := 0
+	reader := newSelectedMaterializedRecordReader(base, materializer, func(rec storage.Record) (*recordSelection, error) {
+		materializedRows += rec.Len()
+		return &recordSelection{ranges: []rowRange{{start: 1, end: 2}}, length: 1}, nil
+	}, false)
+	out, err := reader.Next()
+	require.NoError(t, err)
+	require.Equal(t, 1, out.Len())
+	require.Equal(t, 2, materializedRows)
+	require.Equal(t, "keep", out.Column(100).(*array.String).Value(0))
+	cleanupMaterializedRecord(out)
+	require.NoError(t, reader.Close())
+}
+
+func TestSelectedMaterializedRecordReaderSkipsAllFilteredRecords(t *testing.T) {
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{FieldID: 100, Name: "text", DataType: schemapb.DataType_VarChar}}}
+	materializer, err := NewRecordMaterializer(schema, nil, map[int64]struct{}{100: {}})
+	require.NoError(t, err)
+	input := newStringArray(t, []string{"drop"})
+	defer input.Release()
+	record := &materializerTestRecord{len: 1, columns: map[storage.FieldID]arrow.Array{100: input}}
+	base := &materializerTestReader{records: []*materializerTestRecord{record}}
+	reader := newSelectedMaterializedRecordReader(base, materializer, func(storage.Record) (*recordSelection, error) {
+		return &recordSelection{}, nil
+	}, false)
+	_, err = reader.Next()
+	require.Error(t, err)
+	require.True(t, base.closed == false)
+	require.NoError(t, reader.Close())
+}
+
+func TestSelectedMaterializedRecordReaderActiveFilterDisablesForwardingShape(t *testing.T) {
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64,
+	}}}
+	input := newInt64Array(t, []int64{1, 2})
+	defer input.Release()
+	record := &materializerTestRecord{len: 2, columns: map[storage.FieldID]arrow.Array{100: input}}
+	base := &materializerTestReader{records: []*materializerTestRecord{record}}
+	materializer, err := NewRecordMaterializer(schema, nil, map[int64]struct{}{100: {}})
+	require.NoError(t, err)
+	reader := newSelectedMaterializedRecordReader(base, materializer, func(storage.Record) (*recordSelection, error) {
+		return nil, nil
+	}, true)
+	out, err := reader.Next()
+	require.NoError(t, err)
+	_, isForwardable := out.(*nonForwardableRecord)
+	require.True(t, isForwardable)
+	cleanupMaterializedRecord(out)
+	require.NoError(t, reader.Close())
 }
 
 // A consumer that keeps a wrapped record across a reader advance must Retain it;

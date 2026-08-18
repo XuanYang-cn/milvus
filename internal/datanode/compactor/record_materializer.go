@@ -288,6 +288,89 @@ type materializedRecordReader struct {
 	current      storage.Record
 }
 
+// selectedMaterializedRecordReader applies row selection to the borrowed source
+// record before invoking function and missing-field materializers.  A dropped
+// record never reaches a materializer or downstream merge heap.
+type selectedMaterializedRecordReader struct {
+	base            storage.RecordReader
+	materializer    *RecordMaterializer
+	selectRecord    func(storage.Record) (*recordSelection, error)
+	forceRebuilding bool
+	current         storage.Record
+}
+
+var _ storage.RecordReader = (*selectedMaterializedRecordReader)(nil)
+
+func newSelectedMaterializedRecordReader(base storage.RecordReader, materializer *RecordMaterializer,
+	selectRecord func(storage.Record) (*recordSelection, error), forceRebuilding bool,
+) storage.RecordReader {
+	return &selectedMaterializedRecordReader{
+		base: base, materializer: materializer, selectRecord: selectRecord, forceRebuilding: forceRebuilding,
+	}
+}
+
+func (r *selectedMaterializedRecordReader) Next() (storage.Record, error) {
+	if r.current != nil {
+		cleanupMaterializedRecord(r.current)
+		r.current = nil
+	}
+	for {
+		rec, err := r.base.Next()
+		if err != nil {
+			return nil, err
+		}
+		selection, err := r.selectRecord(rec)
+		if err != nil {
+			return nil, err
+		}
+		if selection != nil && selection.Len() == 0 {
+			continue
+		}
+		wrapped, err := r.materializer.WrapWithSelection(rec, selection)
+		if err != nil {
+			return nil, err
+		}
+		if r.forceRebuilding {
+			wrapped = &nonForwardableRecord{inner: wrapped}
+		}
+		r.current = wrapped
+		return wrapped, nil
+	}
+}
+
+// nonForwardableRecord preserves the borrowed/materialized record lifetime
+// while making active delete/TTL selection fail closed for MergeSort's direct
+// Arrow forwarding path, including records where every row survived.
+type nonForwardableRecord struct {
+	inner storage.Record
+}
+
+var _ storage.Record = (*nonForwardableRecord)(nil)
+var _ derivedRecord = (*nonForwardableRecord)(nil)
+
+func (r *nonForwardableRecord) Column(fieldID storage.FieldID) arrow.Array {
+	return r.inner.Column(fieldID)
+}
+
+func (r *nonForwardableRecord) Len() int { return r.inner.Len() }
+
+func (r *nonForwardableRecord) Retain() { r.inner.Retain() }
+
+func (r *nonForwardableRecord) Release() { r.inner.Release() }
+
+func (r *nonForwardableRecord) cleanupDerived() {
+	cleanupMaterializedRecord(r.inner)
+}
+
+func (r *selectedMaterializedRecordReader) Close() error {
+	if r.current != nil {
+		cleanupMaterializedRecord(r.current)
+		r.current = nil
+	}
+	r.materializer.Close()
+	return r.base.Close()
+}
+
 var _ storage.RecordReader = (*materializedRecordReader)(nil)
 
 func newMaterializedRecordReader(base storage.RecordReader, materializer *RecordMaterializer) storage.RecordReader {

@@ -22,7 +22,9 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/apache/arrow/go/v17/arrow/array"
@@ -31,9 +33,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 type oneShotRecordReader struct {
@@ -108,6 +112,46 @@ func (r *sliceRecordReader) Next() (Record, error) {
 }
 
 func (r *sliceRecordReader) Close() error { return nil }
+
+// benchmarkRebuildRecord deliberately hides the concrete Arrow record type so
+// BenchmarkMergeSortDisjoint's rebuild case exercises the normal prepared
+// output path without a production benchmark toggle.
+type benchmarkRebuildRecord struct {
+	inner Record
+}
+
+var _ Record = benchmarkRebuildRecord{}
+
+func (r benchmarkRebuildRecord) Column(fieldID FieldID) arrow.Array { return r.inner.Column(fieldID) }
+func (r benchmarkRebuildRecord) Len() int                           { return r.inner.Len() }
+func (r benchmarkRebuildRecord) Release()                           { r.inner.Release() }
+func (r benchmarkRebuildRecord) Retain()                            { r.inner.Retain() }
+
+// testNonForwardableRecord hides the concrete Arrow type from MergeSort while
+// retaining ordinary Record semantics. It lets tests force a rebuilt prefix
+// without introducing a production-only fast-path switch.
+type testNonForwardableRecord struct {
+	inner Record
+}
+
+var _ Record = testNonForwardableRecord{}
+
+func (r testNonForwardableRecord) Column(fieldID FieldID) arrow.Array { return r.inner.Column(fieldID) }
+func (r testNonForwardableRecord) Len() int                           { return r.inner.Len() }
+func (r testNonForwardableRecord) Release()                           { r.inner.Release() }
+func (r testNonForwardableRecord) Retain()                            { r.inner.Retain() }
+
+func arrowValueBufferAddress(t *testing.T, a arrow.Array) uintptr {
+	t.Helper()
+	for i := len(a.Data().Buffers()) - 1; i >= 0; i-- {
+		buffer := a.Data().Buffers()[i]
+		if buffer != nil && len(buffer.Bytes()) > 0 {
+			return uintptr(unsafe.Pointer(&buffer.Bytes()[0]))
+		}
+	}
+	t.Fatal("array has no non-empty data buffer")
+	return 0
+}
 
 func TestRadixSortByInt64(t *testing.T) {
 	t.Run("edge values across records", func(t *testing.T) {
@@ -454,6 +498,121 @@ func TestMergeSortReturnsRecordBuilderAppendError(t *testing.T) {
 	assert.ErrorContains(t, err, "failed to append value")
 }
 
+func TestMergeSortPreparedOutputMatchesGenericRecordBuilder(t *testing.T) {
+	const keyField = FieldID(100)
+	const nullableField = FieldID(101)
+	const defaultField = FieldID(102)
+	const textField = FieldID(103)
+	const geometryField = FieldID(104)
+	const vectorArrayField = FieldID(105)
+	const structChildField = FieldID(106)
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: keyField, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{FieldID: nullableField, Name: "nullable", DataType: schemapb.DataType_Int64, Nullable: true},
+			{
+				FieldID: defaultField, Name: "with_default", DataType: schemapb.DataType_Int64, Nullable: true,
+				DefaultValue: &schemapb.ValueField{Data: &schemapb.ValueField_LongData{LongData: 42}},
+			},
+			{FieldID: textField, Name: "text", DataType: schemapb.DataType_Text, Nullable: true},
+			{FieldID: geometryField, Name: "geometry", DataType: schemapb.DataType_Geometry, Nullable: true},
+			{
+				FieldID: vectorArrayField, Name: "vector_array", DataType: schemapb.DataType_ArrayOfVector,
+				ElementType: schemapb.DataType_FloatVector,
+				TypeParams:  []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "2"}},
+			},
+		},
+		StructArrayFields: []*schemapb.StructArrayFieldSchema{{
+			Name: "struct", Fields: []*schemapb.FieldSchema{{
+				FieldID: structChildField, Name: "child", DataType: schemapb.DataType_VarChar, Nullable: true,
+			}},
+		}},
+	}
+
+	newValidity := func(valid []bool) []bool { return append([]bool(nil), valid...) }
+	keyBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+	keyBuilder.AppendValues([]int64{0, 1, 2}, nil)
+	keyArray := keyBuilder.NewArray()
+	keyBuilder.Release()
+
+	nullableBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+	nullableBuilder.AppendValues([]int64{10, 0, 30}, newValidity([]bool{true, false, true}))
+	nullableArray := nullableBuilder.NewArray()
+	nullableBuilder.Release()
+
+	defaultBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+	defaultBuilder.AppendValues([]int64{1, 0, 3}, newValidity([]bool{true, false, true}))
+	defaultArray := defaultBuilder.NewArray()
+	defaultBuilder.Release()
+
+	textBuilder := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	textBuilder.AppendValues([][]byte{[]byte("lob-0"), nil, []byte("lob-2")}, newValidity([]bool{true, false, true}))
+	textArray := textBuilder.NewArray()
+	textBuilder.Release()
+
+	geometryBuilder := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	geometryBuilder.AppendValues([][]byte{{1, 2}, nil, {3, 4}}, newValidity([]bool{true, false, true}))
+	geometryArray := geometryBuilder.NewArray()
+	geometryBuilder.Release()
+
+	vectorType := &arrow.FixedSizeBinaryType{ByteWidth: 8}
+	vectorListBuilder := array.NewListBuilder(memory.DefaultAllocator, vectorType)
+	vectorValues := vectorListBuilder.ValueBuilder().(*array.FixedSizeBinaryBuilder)
+	vectorListBuilder.Append(true)
+	vectorValues.Append([]byte{0, 1, 2, 3, 4, 5, 6, 7})
+	vectorListBuilder.Append(true)
+	vectorValues.Append([]byte{8, 9, 10, 11, 12, 13, 14, 15})
+	vectorValues.Append([]byte{16, 17, 18, 19, 20, 21, 22, 23})
+	vectorListBuilder.Append(true)
+	vectorArray := vectorListBuilder.NewArray()
+	vectorListBuilder.Release()
+
+	structChildBuilder := array.NewStringBuilder(memory.DefaultAllocator)
+	structChildBuilder.AppendValues([]string{"a", "", "c"}, newValidity([]bool{true, false, true}))
+	structChildArray := structChildBuilder.NewArray()
+	structChildBuilder.Release()
+
+	arrays := []arrow.Array{keyArray, nullableArray, defaultArray, textArray, geometryArray, vectorArray, structChildArray}
+	defer func() {
+		for _, a := range arrays {
+			a.Release()
+		}
+	}()
+	arrowSchema, err := ConvertToArrowSchema(schema, false)
+	require.NoError(t, err)
+	arrowFields := arrowSchema.Fields()
+	arrowFields[3].Type = arrow.BinaryTypes.Binary
+	rec := NewSimpleArrowRecord(array.NewRecord(
+		arrow.NewSchema(arrowFields, nil), arrays, 3),
+		map[FieldID]int{
+			keyField: 0, nullableField: 1, defaultField: 2, textField: 3, geometryField: 4,
+			vectorArrayField: 5, structChildField: 6,
+		})
+	defer rec.Release()
+
+	referenceBuilder := NewRecordBuilder(schema)
+	require.NoError(t, referenceBuilder.Append(rec, 0, rec.Len()))
+	reference := referenceBuilder.Build()
+	referenceBuilder.Release()
+	defer reference.Release()
+
+	var output Record
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		out.Retain()
+		output = out
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema, []RecordReader{&oneShotRecordReader{rec: rec}}, rw,
+		func(Record, int, int) bool { return true }, []int64{keyField})
+	require.NoError(t, err)
+	require.Equal(t, rec.Len(), n)
+	require.NotNil(t, output)
+	defer output.Release()
+	for _, field := range typeutil.GetAllFieldSchemas(schema) {
+		require.True(t, array.Equal(reference.Column(field.GetFieldID()), output.Column(field.GetFieldID())), field.GetName())
+	}
+}
+
 // Benchmark sort
 func BenchmarkSort(b *testing.B) {
 	batch := 500000
@@ -572,6 +731,50 @@ func BenchmarkMergeSortVarcharKey(b *testing.B) {
 			assert.NoError(b, err)
 		}
 	})
+}
+
+func BenchmarkMergeSortDisjoint(b *testing.B) {
+	const rows = 32768
+	const batchSize = 64 * 1024 * 1024
+	const pkField = FieldID(100)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: pkField, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	arrowSchema := arrow.NewSchema([]arrow.Field{{
+		Name: "pk", Type: arrow.PrimitiveTypes.Int64,
+		Metadata: arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{"100"}),
+	}}, nil)
+	build := func(start int64) Record {
+		values := make([]int64, rows)
+		for i := range values {
+			values[i] = start + int64(i)
+		}
+		builder := array.NewInt64Builder(memory.DefaultAllocator)
+		builder.AppendValues(values, nil)
+		arr := builder.NewArray()
+		builder.Release()
+		rec := NewSimpleArrowRecord(array.NewRecord(arrowSchema, []arrow.Array{arr}, rows), map[FieldID]int{pkField: 0})
+		arr.Release()
+		return rec
+	}
+	recs0 := []Record{build(0)}
+	recs1 := []Record{build(rows)}
+	defer recs0[0].Release()
+	defer recs1[0].Release()
+	rebuild0 := []Record{benchmarkRebuildRecord{inner: recs0[0]}}
+	rebuild1 := []Record{benchmarkRebuildRecord{inner: recs1[0]}}
+	rw := &MockRecordWriter{writefn: func(Record) error { return nil }, closefn: func() error { return nil }}
+	run := func(b *testing.B, records0, records1 []Record) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, err := MergeSort(batchSize, schema,
+				[]RecordReader{&sliceRecordReader{recs: records0}, &sliceRecordReader{recs: records1}}, rw,
+				func(Record, int, int) bool { return true }, []int64{pkField})
+			require.NoError(b, err)
+		}
+	}
+	b.Run("rebuild", func(b *testing.B) { run(b, rebuild0, rebuild1) })
+	b.Run("forward", func(b *testing.B) { run(b, recs0, recs1) })
 }
 
 func TestSortByMoreThanOneField(t *testing.T) {
@@ -722,6 +925,483 @@ func TestMergeSortPredicateCalledOncePerRow(t *testing.T) {
 	for pk, n := range counts {
 		assert.Equalf(t, 1, n, "predicate called %d times for pk %d", n, pk)
 	}
+}
+
+func TestMergeSortDirectForwardsContiguousRecord(t *testing.T) {
+	const rows = 256
+	const field = FieldID(100)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	builder := array.NewInt64Builder(memory.DefaultAllocator)
+	values := make([]int64, rows)
+	for i := range values {
+		values[i] = int64(i)
+	}
+	builder.AppendValues(values, nil)
+	arr := builder.NewArray()
+	builder.Release()
+	rec := NewSimpleArrowRecord(array.NewRecord(
+		arrow.NewSchema([]arrow.Field{{Name: "pk", Type: arrow.PrimitiveTypes.Int64}}, nil),
+		[]arrow.Array{arr}, rows), map[FieldID]int{field: 0})
+	arr.Release()
+	defer rec.Release()
+
+	writes := 0
+	sourceBuffer := arrowValueBufferAddress(t, rec.Column(field))
+	var outputBuffer uintptr
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		writes++
+		outputBuffer = arrowValueBufferAddress(t, out.Column(field))
+		require.Equal(t, rows, out.Len())
+		return nil
+	}, closefn: func() error { return nil }}
+	reader := &oneShotRecordReader{rec: rec}
+	calls := 0
+	n, err := MergeSort(64*1024*1024, schema, []RecordReader{reader}, rw, func(Record, int, int) bool { calls++; return true }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, rows, n)
+	require.Equal(t, rows, calls)
+	require.Equal(t, 1, writes)
+	require.Equal(t, sourceBuffer, outputBuffer, "direct forwarding must reuse the source value buffer")
+}
+
+func TestMergeSortDirectForwardsPrefixSlice(t *testing.T) {
+	const field = FieldID(100)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	leftValues := make([]int64, 300)
+	for i := range leftValues {
+		leftValues[i] = int64(i)
+	}
+	left := mergeSortTestRec(t, map[FieldID][]int64{field: leftValues}, nil)
+	right := mergeSortTestRec(t, map[FieldID][]int64{field: {128, 512}}, nil)
+	defer left.Release()
+	defer right.Release()
+
+	sourceBuffer := arrowValueBufferAddress(t, left.Column(field))
+	forwardedPrefix := false
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		if out.Len() >= directForwardMinRows && arrowValueBufferAddress(t, out.Column(field)) == sourceBuffer {
+			values := out.Column(field).(*array.Int64)
+			require.Equal(t, int64(0), values.Value(0))
+			require.LessOrEqual(t, values.Value(out.Len()-1), int64(128))
+			forwardedPrefix = true
+		}
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema,
+		[]RecordReader{&oneShotRecordReader{rec: left}, &oneShotRecordReader{rec: right}}, rw,
+		func(Record, int, int) bool { return true }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, 302, n)
+	require.True(t, forwardedPrefix, "eligible record prefix must be forwarded without copying")
+}
+
+func TestMergeSortDirectForwardsSuffixSlice(t *testing.T) {
+	const field = FieldID(100)
+	const payloadField = FieldID(101)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+		{FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+		{FieldID: payloadField, Name: "payload", DataType: schemapb.DataType_VarChar},
+	}}
+	leftValues := make([]int64, 300)
+	leftPayloads := make([]string, len(leftValues))
+	leftValues[0] = 0
+	for i := 1; i < len(leftValues); i++ {
+		leftValues[i] = int64(i + 1)
+	}
+	left := mergeSortTestRec(t, map[FieldID][]int64{field: leftValues}, map[FieldID][]string{payloadField: leftPayloads})
+	right := mergeSortTestRec(t, map[FieldID][]int64{field: {1}}, map[FieldID][]string{payloadField: {strings.Repeat("x", 6000)}})
+	defer left.Release()
+	defer right.Release()
+
+	sourceBuffer := arrowValueBufferAddress(t, left.Column(field))
+	forwardedSuffix := false
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		if out.Len() == len(leftValues)-1 && arrowValueBufferAddress(t, out.Column(field)) == sourceBuffer {
+			values := out.Column(field).(*array.Int64)
+			require.Equal(t, int64(2), values.Value(0))
+			forwardedSuffix = true
+		}
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(5000, schema,
+		[]RecordReader{&oneShotRecordReader{rec: left}, &oneShotRecordReader{rec: right}}, rw,
+		func(Record, int, int) bool { return true }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, 301, n)
+	require.True(t, forwardedSuffix, "eligible record suffix must be forwarded without copying")
+}
+
+func TestMergeSortDirectForwardsMiddleSlice(t *testing.T) {
+	const field = FieldID(100)
+	const payloadField = FieldID(101)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+		{FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+		{FieldID: payloadField, Name: "payload", DataType: schemapb.DataType_VarChar},
+	}}
+	leftValues := make([]int64, 400)
+	leftPayloads := make([]string, len(leftValues))
+	leftValues[0] = 0
+	for i := 1; i < len(leftValues); i++ {
+		leftValues[i] = int64(i + 1)
+	}
+	left := mergeSortTestRec(t, map[FieldID][]int64{field: leftValues}, map[FieldID][]string{payloadField: leftPayloads})
+	right := mergeSortTestRec(t, map[FieldID][]int64{field: {1, 300}}, map[FieldID][]string{payloadField: {strings.Repeat("x", 6000), ""}})
+	defer left.Release()
+	defer right.Release()
+
+	sourceBuffer := arrowValueBufferAddress(t, left.Column(field))
+	forwardedMiddle := false
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		if out.Len() >= directForwardMinRows && out.Len() < len(leftValues)-1 &&
+			arrowValueBufferAddress(t, out.Column(field)) == sourceBuffer {
+			values := out.Column(field).(*array.Int64)
+			require.Equal(t, int64(2), values.Value(0))
+			require.LessOrEqual(t, values.Value(out.Len()-1), int64(300))
+			forwardedMiddle = true
+		}
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(5000, schema,
+		[]RecordReader{&oneShotRecordReader{rec: left}, &oneShotRecordReader{rec: right}}, rw,
+		func(Record, int, int) bool { return true }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, 402, n)
+	require.True(t, forwardedMiddle, "eligible record middle must be forwarded without copying")
+}
+
+func TestMergeSortDirectForwardFallsBackForSmallInterval(t *testing.T) {
+	const field = FieldID(100)
+	values := make([]int64, directForwardMinRows-1)
+	for i := range values {
+		values[i] = int64(i)
+	}
+	rec := mergeSortTestRec(t, map[FieldID][]int64{field: values}, nil)
+	defer rec.Release()
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	sourceBuffer := arrowValueBufferAddress(t, rec.Column(field))
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		require.NotEqual(t, sourceBuffer, arrowValueBufferAddress(t, out.Column(field)))
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema, []RecordReader{&oneShotRecordReader{rec: rec}}, rw,
+		func(Record, int, int) bool { return true }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, len(values), n)
+}
+
+func TestMergeSortDirectForwardKeepsPendingRebuiltBatchCombined(t *testing.T) {
+	const field = FieldID(100)
+	leftValues := make([]int64, 300)
+	leftValues[0] = 0
+	for i := 1; i < len(leftValues); i++ {
+		leftValues[i] = int64(i + 1)
+	}
+	left := mergeSortTestRec(t, map[FieldID][]int64{field: leftValues}, nil)
+	right := mergeSortTestRec(t, map[FieldID][]int64{field: {1}}, nil)
+	defer left.Release()
+	defer right.Release()
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	sourceBuffer := arrowValueBufferAddress(t, left.Column(field))
+	writes := 0
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		writes++
+		require.Equal(t, len(leftValues)+1, out.Len())
+		require.NotEqual(t, sourceBuffer, arrowValueBufferAddress(t, out.Column(field)),
+			"a forwarded suffix must not split an existing rebuilt batch")
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema,
+		[]RecordReader{&oneShotRecordReader{rec: left}, &oneShotRecordReader{rec: right}}, rw,
+		func(Record, int, int) bool { return true }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, len(leftValues)+1, n)
+	require.Equal(t, 1, writes)
+}
+
+func TestMergeSortDirectForwardFallsBackWhenLaterRowIsFiltered(t *testing.T) {
+	const rows = 256
+	const field = FieldID(100)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	builder := array.NewInt64Builder(memory.DefaultAllocator)
+	values := make([]int64, rows)
+	for i := range values {
+		values[i] = int64(i)
+	}
+	builder.AppendValues(values, nil)
+	arr := builder.NewArray()
+	builder.Release()
+	rec := NewSimpleArrowRecord(array.NewRecord(
+		arrow.NewSchema([]arrow.Field{{Name: "pk", Type: arrow.PrimitiveTypes.Int64}}, nil),
+		[]arrow.Array{arr}, rows), map[FieldID]int{field: 0})
+	arr.Release()
+	defer rec.Release()
+
+	emittedRows := 0
+	sourceBuffer := arrowValueBufferAddress(t, rec.Column(field))
+	var outputBuffers []uintptr
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		outputBuffers = append(outputBuffers, arrowValueBufferAddress(t, out.Column(field)))
+		values := out.Column(field).(*array.Int64)
+		for i := 0; i < out.Len(); i++ {
+			require.NotEqual(t, int64(128), values.Value(i))
+		}
+		emittedRows += out.Len()
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema, []RecordReader{&oneShotRecordReader{rec: rec}}, rw,
+		func(r Record, _, i int) bool { return i != 128 }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, rows-1, n)
+	require.Equal(t, rows-1, emittedRows)
+	for _, outputBuffer := range outputBuffers {
+		require.NotEqual(t, sourceBuffer, outputBuffer, "a filtered source record must be rebuilt")
+	}
+}
+
+func TestMergeSortFilteredRecordDoesNotLeakDiscardedForwardSlice(t *testing.T) {
+	const rows = 300
+	const field = FieldID(100)
+	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	builder := array.NewInt64Builder(alloc)
+	for i := range rows {
+		builder.Append(int64(i))
+	}
+	arr := builder.NewArray()
+	builder.Release()
+	rec := NewSimpleArrowRecord(array.NewRecord(
+		arrow.NewSchema([]arrow.Field{{Name: "pk", Type: arrow.PrimitiveTypes.Int64}}, nil),
+		[]arrow.Array{arr}, rows), map[FieldID]int{field: 0})
+	arr.Release()
+
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	rw := &MockRecordWriter{writefn: func(Record) error { return nil }, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema, []RecordReader{&oneShotRecordReader{rec: rec}}, rw,
+		func(_ Record, _, i int) bool { return i != 0 }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, rows-1, n)
+	rec.Release()
+	alloc.AssertSize(t, 0)
+}
+
+func TestMergeSortDirectForwardFallsBackForNullableDefault(t *testing.T) {
+	const rows = 256
+	const keyField = FieldID(100)
+	const defaultField = FieldID(101)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+		{FieldID: keyField, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+		{
+			FieldID: defaultField, Name: "with_default", DataType: schemapb.DataType_Int64, Nullable: true,
+			DefaultValue: &schemapb.ValueField{Data: &schemapb.ValueField_LongData{LongData: 42}},
+		},
+	}}
+	keyBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+	defaultBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+	for i := range rows {
+		keyBuilder.Append(int64(i))
+		defaultBuilder.AppendNull()
+	}
+	keyArray, defaultArray := keyBuilder.NewArray(), defaultBuilder.NewArray()
+	keyBuilder.Release()
+	defaultBuilder.Release()
+	rec := NewSimpleArrowRecord(array.NewRecord(
+		arrow.NewSchema([]arrow.Field{
+			{Name: "pk", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "with_default", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		}, nil),
+		[]arrow.Array{keyArray, defaultArray}, rows), map[FieldID]int{keyField: 0, defaultField: 1})
+	keyArray.Release()
+	defaultArray.Release()
+	defer rec.Release()
+
+	sourceBuffer := arrowValueBufferAddress(t, rec.Column(keyField))
+	var outputBuffer uintptr
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		outputBuffer = arrowValueBufferAddress(t, out.Column(keyField))
+		values := out.Column(defaultField).(*array.Int64)
+		for i := range out.Len() {
+			require.True(t, values.IsValid(i))
+			require.Equal(t, int64(42), values.Value(i))
+		}
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema, []RecordReader{&oneShotRecordReader{rec: rec}}, rw,
+		func(Record, int, int) bool { return true }, []int64{keyField})
+	require.NoError(t, err)
+	require.Equal(t, rows, n)
+	require.NotEqual(t, sourceBuffer, outputBuffer, "default replacement requires rebuilding")
+}
+
+func TestMergeSortDirectForwardKeepsBorrowedBuffersAliveDuringWrite(t *testing.T) {
+	const rows = 256
+	const field = FieldID(100)
+	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	builder := array.NewInt64Builder(alloc)
+	for i := range rows {
+		builder.Append(int64(i))
+	}
+	arr := builder.NewArray()
+	builder.Release()
+	rec := NewSimpleArrowRecord(array.NewRecord(
+		arrow.NewSchema([]arrow.Field{{Name: "pk", Type: arrow.PrimitiveTypes.Int64}}, nil),
+		[]arrow.Array{arr}, rows), map[FieldID]int{field: 0})
+	arr.Release()
+
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	reader := &oneShotRecordReader{rec: rec}
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		// The source owner may release its record as soon as the synchronous
+		// writer call begins. The forwarded slice must retain the shared buffer.
+		rec.Release()
+		rec = nil
+		values := out.Column(field).(*array.Int64)
+		require.Equal(t, int64(rows-1), values.Value(rows-1))
+		require.Greater(t, alloc.CurrentAlloc(), 0)
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema, []RecordReader{reader}, rw,
+		func(Record, int, int) bool { return true }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, rows, n)
+	require.Nil(t, rec)
+	alloc.AssertSize(t, 0)
+}
+
+func TestMergeSortDirectForwardPreservesEqualKeyReaderOrder(t *testing.T) {
+	const rows = 256
+	const keyField = FieldID(100)
+	const sourceField = FieldID(101)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+		{FieldID: keyField, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+		{FieldID: sourceField, Name: "source", DataType: schemapb.DataType_Int64},
+	}}
+	build := func(key, source int64) Record {
+		arrowSchema, err := ConvertToArrowSchema(schema, false)
+		require.NoError(t, err)
+		keyBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+		sourceBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+		for range rows {
+			keyBuilder.Append(key)
+			sourceBuilder.Append(source)
+		}
+		keyArray, sourceArray := keyBuilder.NewArray(), sourceBuilder.NewArray()
+		keyBuilder.Release()
+		sourceBuilder.Release()
+		rec := NewSimpleArrowRecord(array.NewRecord(arrowSchema, []arrow.Array{keyArray, sourceArray}, rows), map[FieldID]int{keyField: 0, sourceField: 1})
+		keyArray.Release()
+		sourceArray.Release()
+		return rec
+	}
+	r0, r1 := build(7, 0), build(7, 1)
+	defer r0.Release()
+	defer r1.Release()
+	var sources []int64
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		col := out.Column(sourceField).(*array.Int64)
+		for i := 0; i < out.Len(); i++ {
+			sources = append(sources, col.Value(i))
+		}
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema, []RecordReader{&oneShotRecordReader{rec: r0}, &oneShotRecordReader{rec: r1}}, rw,
+		func(Record, int, int) bool { return true }, []int64{keyField})
+	require.NoError(t, err)
+	require.Equal(t, rows*2, n)
+	require.Equal(t, slices.Repeat([]int64{0}, rows), sources[:rows])
+	require.Equal(t, slices.Repeat([]int64{1}, rows), sources[rows:])
+}
+
+func TestMergeSortDirectForwardPreservesEqualKeyOrderAcrossRecords(t *testing.T) {
+	const rows = 128
+	const keyField = FieldID(100)
+	const sourceField = FieldID(101)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+		{FieldID: keyField, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+		{FieldID: sourceField, Name: "source", DataType: schemapb.DataType_Int64},
+	}}
+	build := func(key, source int64) Record {
+		arrowSchema, err := ConvertToArrowSchema(schema, false)
+		require.NoError(t, err)
+		keyBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+		sourceBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+		for range rows {
+			keyBuilder.Append(key)
+			sourceBuilder.Append(source)
+		}
+		keyArray, sourceArray := keyBuilder.NewArray(), sourceBuilder.NewArray()
+		keyBuilder.Release()
+		sourceBuilder.Release()
+		rec := NewSimpleArrowRecord(array.NewRecord(arrowSchema, []arrow.Array{keyArray, sourceArray}, rows), map[FieldID]int{keyField: 0, sourceField: 1})
+		keyArray.Release()
+		sourceArray.Release()
+		return rec
+	}
+	r00, r01, r1 := build(7, 0), build(7, 1), build(7, 2)
+	defer r00.Release()
+	defer r01.Release()
+	defer r1.Release()
+	var sources []int64
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		col := out.Column(sourceField).(*array.Int64)
+		for i := range out.Len() {
+			sources = append(sources, col.Value(i))
+		}
+		return nil
+	}, closefn: func() error { return nil }}
+	n, err := MergeSort(64*1024*1024, schema,
+		[]RecordReader{&sliceRecordReader{recs: []Record{r00, r01}}, &oneShotRecordReader{rec: r1}}, rw,
+		func(Record, int, int) bool { return true }, []int64{keyField})
+	require.NoError(t, err)
+	require.Equal(t, rows*3, n)
+	require.Equal(t, slices.Repeat([]int64{0}, rows), sources[:rows])
+	require.Equal(t, slices.Repeat([]int64{1}, rows), sources[rows:rows*2])
+	require.Equal(t, slices.Repeat([]int64{2}, rows), sources[rows*2:])
+}
+
+func TestMergeSortDirectForwardRebuildsIncompatibleRecord(t *testing.T) {
+	const rows = 256
+	const field = FieldID(100)
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
+		FieldID: field, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
+	}}}
+	values := make([]int64, rows)
+	for i := range values {
+		values[i] = int64(i)
+	}
+	builder := array.NewInt64Builder(memory.DefaultAllocator)
+	builder.AppendValues(values, nil)
+	arr := builder.NewArray()
+	builder.Release()
+	rec := NewSimpleArrowRecord(array.NewRecord(
+		arrow.NewSchema([]arrow.Field{{Name: "extra", Type: arrow.PrimitiveTypes.Int64}, {Name: "pk", Type: arrow.PrimitiveTypes.Int64}}, nil),
+		[]arrow.Array{arr, arr}, rows), map[FieldID]int{field: 1})
+	arr.Release()
+	defer rec.Release()
+	sourceBuffer := arrowValueBufferAddress(t, rec.Column(field))
+	writes := 0
+	rw := &MockRecordWriter{writefn: func(out Record) error {
+		writes++
+		require.Equal(t, 1, out.(*simpleArrowRecord).r.Schema().NumFields())
+		require.NotEqual(t, sourceBuffer, arrowValueBufferAddress(t, out.Column(field)))
+		return nil
+	}, closefn: func() error { return nil }}
+	_, err := MergeSort(64*1024*1024, schema, []RecordReader{&oneShotRecordReader{rec: rec}}, rw,
+		func(Record, int, int) bool { return true }, []int64{field})
+	require.NoError(t, err)
+	require.Equal(t, 1, writes)
 }
 
 func TestRowHeap(t *testing.T) {

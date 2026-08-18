@@ -384,6 +384,447 @@ type RecordBuilder struct {
 	size  uint64
 }
 
+// preparedValueAppender binds a destination builder to one source Arrow array.
+// MergeSort keeps one of these per output field while a reader's current record
+// is live. The type checks and default handling are performed when the record
+// is installed, rather than once for every emitted (row, field) pair. Keeping
+// the builder and source pointers in this typed union avoids both per-row
+// interface assertions and per-record closure allocations.
+type preparedValueAppender struct {
+	appendFn         preparedAppendFunc
+	defaultValue     *schemapb.ValueField
+	geometryWKB      []byte
+	boolBuilder      *array.BooleanBuilder
+	boolSource       *array.Boolean
+	int8Builder      *array.Int8Builder
+	int8Source       *array.Int8
+	int16Builder     *array.Int16Builder
+	int16Source      *array.Int16
+	int32Builder     *array.Int32Builder
+	int32Source      *array.Int32
+	int64Builder     *array.Int64Builder
+	int64Source      *array.Int64
+	float32Builder   *array.Float32Builder
+	float32Source    *array.Float32
+	float64Builder   *array.Float64Builder
+	float64Source    *array.Float64
+	stringBuilder    *array.StringBuilder
+	stringSource     *array.String
+	binaryBuilder    *array.BinaryBuilder
+	binarySource     *array.Binary
+	fixedBuilder     *array.FixedSizeBinaryBuilder
+	fixedSource      *array.FixedSizeBinary
+	listBuilder      *array.ListBuilder
+	listSource       *array.List
+	listValues       *array.FixedSizeBinary
+	listValueBuilder *array.FixedSizeBinaryBuilder
+}
+
+type preparedAppendFunc func(*preparedValueAppender, int) (uint64, error)
+
+type preparedRecordAppender struct {
+	fields []preparedValueAppender
+}
+
+const directForwardMinRows = 128
+
+func prepareValueAppender(builder array.Builder, a arrow.Array, appendDefault appendValueDefault) (preparedValueAppender, error) {
+	app := preparedValueAppender{defaultValue: appendDefault.value, geometryWKB: appendDefault.geometryWKB}
+	invalid := func() error {
+		return merr.WrapErrServiceInternalMsg("invalid source value type %T for builder %T", a, builder)
+	}
+	switch b := builder.(type) {
+	case *array.BooleanBuilder:
+		sa, ok := a.(*array.Boolean)
+		if !ok {
+			return app, invalid()
+		}
+		app.boolBuilder, app.boolSource = b, sa
+		app.appendFn = appendPreparedBool
+	case *array.Int8Builder:
+		sa, ok := a.(*array.Int8)
+		if !ok {
+			return app, invalid()
+		}
+		app.int8Builder, app.int8Source = b, sa
+		app.appendFn = appendPreparedInt8
+	case *array.Int16Builder:
+		sa, ok := a.(*array.Int16)
+		if !ok {
+			return app, invalid()
+		}
+		app.int16Builder, app.int16Source = b, sa
+		app.appendFn = appendPreparedInt16
+	case *array.Int32Builder:
+		sa, ok := a.(*array.Int32)
+		if !ok {
+			return app, invalid()
+		}
+		app.int32Builder, app.int32Source = b, sa
+		app.appendFn = appendPreparedInt32
+	case *array.Int64Builder:
+		sa, ok := a.(*array.Int64)
+		if !ok {
+			return app, invalid()
+		}
+		app.int64Builder, app.int64Source = b, sa
+		app.appendFn = appendPreparedInt64
+	case *array.Float32Builder:
+		sa, ok := a.(*array.Float32)
+		if !ok {
+			return app, invalid()
+		}
+		app.float32Builder, app.float32Source = b, sa
+		app.appendFn = appendPreparedFloat32
+	case *array.Float64Builder:
+		if a == nil {
+			app.float64Builder = b
+			app.appendFn = appendPreparedFloat64
+			return app, nil
+		}
+		sa, ok := a.(*array.Float64)
+		if !ok {
+			return app, invalid()
+		}
+		app.float64Builder, app.float64Source = b, sa
+		app.appendFn = appendPreparedFloat64
+	case *array.StringBuilder:
+		sa, ok := a.(*array.String)
+		if !ok {
+			return app, invalid()
+		}
+		app.stringBuilder, app.stringSource = b, sa
+		app.appendFn = appendPreparedString
+	case *array.BinaryBuilder:
+		sa, ok := a.(*array.Binary)
+		if !ok {
+			return app, invalid()
+		}
+		app.binaryBuilder, app.binarySource = b, sa
+		app.appendFn = appendPreparedBinary
+	case *array.FixedSizeBinaryBuilder:
+		sa, ok := a.(*array.FixedSizeBinary)
+		if !ok {
+			return app, invalid()
+		}
+		app.fixedBuilder, app.fixedSource = b, sa
+		app.appendFn = appendPreparedFixedBinary
+	case *array.ListBuilder:
+		sa, ok := a.(*array.List)
+		if !ok {
+			return app, invalid()
+		}
+		app.listBuilder, app.listSource = b, sa
+		switch valueBuilder := b.ValueBuilder().(type) {
+		case *array.FixedSizeBinaryBuilder:
+			values, ok := sa.ListValues().(*array.FixedSizeBinary)
+			if !ok {
+				return app, merr.WrapErrServiceInternalMsg("unsupported list source value type %T", sa.ListValues())
+			}
+			app.listValues, app.listValueBuilder = values, valueBuilder
+			app.appendFn = appendPreparedListFixedBinary
+		default:
+			return app, merr.WrapErrServiceInternalMsg("unsupported list value builder type %T", b.ValueBuilder())
+		}
+	default:
+		return app, merr.WrapErrServiceInternalMsg("unsupported builder type: %T", builder)
+	}
+	return app, nil
+}
+
+func (a *preparedValueAppender) appendAt(i int) (uint64, error) {
+	if a.appendFn == nil {
+		return 0, merr.WrapErrServiceInternalMsg("prepared appender has no dispatch function")
+	}
+	return a.appendFn(a, i)
+}
+
+func appendPreparedBool(a *preparedValueAppender, i int) (uint64, error) {
+	if a.boolSource.IsNull(i) {
+		if a.defaultValue != nil {
+			a.boolBuilder.Append(a.defaultValue.GetBoolData())
+			return 1, nil
+		}
+		a.boolBuilder.AppendNull()
+		return 0, nil
+	}
+	a.boolBuilder.Append(a.boolSource.Value(i))
+	return 1, nil
+}
+
+func appendPreparedInt8(a *preparedValueAppender, i int) (uint64, error) {
+	if a.int8Source.IsNull(i) {
+		if a.defaultValue != nil {
+			a.int8Builder.Append(int8(a.defaultValue.GetIntData()))
+			return 1, nil
+		}
+		a.int8Builder.AppendNull()
+		return 0, nil
+	}
+	a.int8Builder.Append(a.int8Source.Value(i))
+	return 1, nil
+}
+
+func appendPreparedInt16(a *preparedValueAppender, i int) (uint64, error) {
+	if a.int16Source.IsNull(i) {
+		if a.defaultValue != nil {
+			a.int16Builder.Append(int16(a.defaultValue.GetIntData()))
+			return 2, nil
+		}
+		a.int16Builder.AppendNull()
+		return 0, nil
+	}
+	a.int16Builder.Append(a.int16Source.Value(i))
+	return 2, nil
+}
+
+func appendPreparedInt32(a *preparedValueAppender, i int) (uint64, error) {
+	if a.int32Source.IsNull(i) {
+		if a.defaultValue != nil {
+			a.int32Builder.Append(a.defaultValue.GetIntData())
+			return 4, nil
+		}
+		a.int32Builder.AppendNull()
+		return 0, nil
+	}
+	a.int32Builder.Append(a.int32Source.Value(i))
+	return 4, nil
+}
+
+func appendPreparedInt64(a *preparedValueAppender, i int) (uint64, error) {
+	if a.int64Source.IsNull(i) {
+		if a.defaultValue != nil {
+			a.int64Builder.Append(a.defaultValue.GetLongData())
+			return 8, nil
+		}
+		a.int64Builder.AppendNull()
+		return 0, nil
+	}
+	a.int64Builder.Append(a.int64Source.Value(i))
+	return 8, nil
+}
+
+func appendPreparedFloat32(a *preparedValueAppender, i int) (uint64, error) {
+	if a.float32Source.IsNull(i) {
+		if a.defaultValue != nil {
+			a.float32Builder.Append(a.defaultValue.GetFloatData())
+			return 4, nil
+		}
+		a.float32Builder.AppendNull()
+		return 0, nil
+	}
+	a.float32Builder.Append(a.float32Source.Value(i))
+	return 4, nil
+}
+
+func appendPreparedFloat64(a *preparedValueAppender, i int) (uint64, error) {
+	if a.float64Source == nil {
+		if a.defaultValue != nil {
+			a.float64Builder.Append(a.defaultValue.GetDoubleData())
+			return 8, nil
+		}
+		a.float64Builder.AppendNull()
+		return 0, nil
+	}
+	if a.float64Source.IsNull(i) {
+		a.float64Builder.AppendNull()
+		return 0, nil
+	}
+	a.float64Builder.Append(a.float64Source.Value(i))
+	return 8, nil
+}
+
+func appendPreparedString(a *preparedValueAppender, i int) (uint64, error) {
+	if a.stringSource.IsNull(i) {
+		if a.defaultValue != nil {
+			v := a.defaultValue.GetStringData()
+			a.stringBuilder.Append(v)
+			return uint64(len(v)), nil
+		}
+		a.stringBuilder.AppendNull()
+		return 0, nil
+	}
+	v := a.stringSource.Value(i)
+	a.stringBuilder.Append(v)
+	return uint64(len(v)), nil
+}
+
+func appendPreparedBinary(a *preparedValueAppender, i int) (uint64, error) {
+	if a.binarySource.IsNull(i) {
+		if a.defaultValue != nil {
+			v := a.defaultValue.GetBytesData()
+			if len(a.geometryWKB) > 0 {
+				v = a.geometryWKB
+			}
+			a.binaryBuilder.Append(v)
+			return uint64(len(v)), nil
+		}
+		a.binaryBuilder.AppendNull()
+		return 0, nil
+	}
+	v := a.binarySource.Value(i)
+	a.binaryBuilder.Append(v)
+	return uint64(len(v)), nil
+}
+
+func appendPreparedFixedBinary(a *preparedValueAppender, i int) (uint64, error) {
+	if a.fixedSource.IsNull(i) {
+		a.fixedBuilder.AppendNull()
+		return 0, nil
+	}
+	v := a.fixedSource.Value(i)
+	a.fixedBuilder.Append(v)
+	return uint64(len(v)), nil
+}
+
+func appendPreparedListFixedBinary(a *preparedValueAppender, i int) (uint64, error) {
+	if a.listSource.IsNull(i) {
+		a.listBuilder.AppendNull()
+		return 0, nil
+	}
+	start, end := a.listSource.ValueOffsets(i)
+	a.listBuilder.Append(true)
+	var size uint64
+	for j := start; j < end; j++ {
+		v := a.listValues.Value(int(j))
+		a.listValueBuilder.Append(v)
+		size += uint64(len(v))
+	}
+	return size, nil
+}
+
+// prepareRecord binds every destination builder to the corresponding source
+// column once for the lifetime of rec. Callers invoke appendPreparedRow for
+// each emitted row until the reader advances.
+func (b *RecordBuilder) prepareRecord(rec Record, prepared *preparedRecordAppender) error {
+	if err := b.prepareAppendDefaults(); err != nil {
+		return err
+	}
+	if len(prepared.fields) != len(b.builders) {
+		prepared.fields = make([]preparedValueAppender, len(b.builders))
+	}
+	for i, builder := range b.builders {
+		col := rec.Column(b.fields[i].FieldID)
+		appender, err := prepareValueAppender(builder, col, b.defaults[i])
+		if err != nil {
+			return merr.Wrapf(err, "failed to append value for field %s", b.fields[i].GetName())
+		}
+		prepared.fields[i] = appender
+	}
+	return nil
+}
+
+// appendPreparedRow appends one row through already-bound field appenders.
+func (b *RecordBuilder) appendPreparedRow(prepared *preparedRecordAppender, idx int) error {
+	for i := range prepared.fields {
+		size, err := prepared.fields[i].appendAt(idx)
+		if err != nil {
+			return merr.Wrapf(err, "failed to append value at offset %d for field %s", idx, b.fields[i].GetName())
+		}
+		b.size += size
+	}
+	b.nRows++
+	return nil
+}
+
+// reservePrepared reserves only a bounded amount of near-term row capacity.
+// Reserving the whole input segment defeats the reader-count memory bound and
+// is particularly harmful for wide vector schemas.
+func (b *RecordBuilder) reservePrepared(rows int) {
+	if rows <= 0 {
+		return
+	}
+	if rows > 4096 {
+		rows = 4096
+	}
+	for _, builder := range b.builders {
+		reserveBuilderRows(builder, rows)
+	}
+}
+
+func reserveBuilderRows(builder array.Builder, rows int) {
+	switch b := builder.(type) {
+	case *array.ListBuilder:
+		b.Reserve(rows)
+		b.ValueBuilder().Reserve(rows)
+	default:
+		builder.Reserve(rows)
+	}
+}
+
+// canDirectForwardRecord reports whether rec is already in the exact Arrow
+// shape and logical value state the builder would produce. It is deliberately
+// strict: an unknown or wrapped record falls back to prepared rebuilding.
+func (b *RecordBuilder) canDirectForwardRecord(rec Record) bool {
+	sar, ok := rec.(*simpleArrowRecord)
+	if !ok {
+		return false
+	}
+	if err := b.prepareAppendDefaults(); err != nil {
+		return false
+	}
+	if sar.r.Schema().NumFields() != len(b.fields) {
+		return false
+	}
+	for i, field := range b.fields {
+		colIdx, exists := sar.field2Col[field.GetFieldID()]
+		// A writer-compatible simple Arrow record must use the exact writer field
+		// order. This also proves every source column is used once, without a
+		// temporary seen-columns allocation on each run eligibility check.
+		if !exists || colIdx != i || colIdx >= int(sar.r.NumCols()) ||
+			sar.r.Column(colIdx).DataType().Fingerprint() != b.arrowFields[i].Type.Fingerprint() {
+			return false
+		}
+		col := sar.r.Column(colIdx)
+		if !b.arrowFields[i].Nullable && col.NullN() > 0 {
+			return false
+		}
+		// RecordBuilder replaces nulls with schema defaults. Forwarding a column
+		// that contains nulls would bypass that logical rewrite even though its
+		// physical Arrow type matches.
+		if b.defaults[i].value != nil && col.NullN() > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// directForwardRecord builds a writer-schema Arrow record over zero-copy source
+// slices. It accepts only a simple Arrow source with every destination field
+// present and an identical physical Arrow type; wrappers and missing fields
+// fail closed into the prepared rebuilding path.
+func (b *RecordBuilder) directForwardRecord(rec Record, start, end int, maxSize uint64) (*simpleArrowRecord, bool) {
+	if end-start < directForwardMinRows {
+		return nil, false
+	}
+	sar, ok := rec.(*simpleArrowRecord)
+	if !ok || !b.canDirectForwardRecord(rec) || start < 0 || end > sar.Len() || start >= end {
+		return nil, false
+	}
+	arrays := make([]arrow.Array, len(b.fields))
+	field2Col := make(map[FieldID]int, len(b.fields))
+	var size uint64
+	for i, field := range b.fields {
+		colIdx := sar.field2Col[field.GetFieldID()]
+		col := sar.r.Column(colIdx)
+		arrays[i] = array.NewSlice(col, int64(start), int64(end))
+		size += calculateActualDataSize(arrays[i])
+		field2Col[field.GetFieldID()] = i
+	}
+	if size > maxSize {
+		for _, col := range arrays {
+			col.Release()
+		}
+		return nil, false
+	}
+	recSchema := arrow.NewSchema(b.arrowFields, nil)
+	out := array.NewRecord(recSchema, arrays, int64(end-start))
+	for _, col := range arrays {
+		col.Release()
+	}
+	return NewSimpleArrowRecord(out, field2Col), true
+}
+
 func (b *RecordBuilder) prepareAppendDefaults() error {
 	if b.defaults != nil {
 		return nil

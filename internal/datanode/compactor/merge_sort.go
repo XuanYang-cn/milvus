@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/apache/arrow/go/v17/arrow/array"
 	"go.opentelemetry.io/otel"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
@@ -62,6 +61,7 @@ func mergeSortMultipleSegments(ctx context.Context,
 	hasTTLField := ttlFieldID >= common.StartOfUserFieldID
 
 	segmentReaders := make([]storage.RecordReader, len(binlogs))
+	segmentTotalRows := make([]int64, len(binlogs))
 	defer func() {
 		for _, r := range segmentReaders {
 			if r != nil {
@@ -86,48 +86,47 @@ func mergeSortMultipleSegments(ctx context.Context,
 			reader.Close()
 			return nil, err
 		}
-		reader = newMaterializedRecordReader(reader, materializer)
-		segmentReaders[i] = wrapReaderWithTimestampOverwrite(reader, s.GetCommitTimestamp())
 		delta, err := compaction.ComposeDeleteFromDeltalogs(ctx, pkField.DataType, s,
 			storage.WithDownloader(binlogIO.Download),
 			storage.WithStorageConfig(compactionParams.StorageConfig))
 		if err != nil {
+			materializer.Close()
+			reader.Close()
 			return nil, err
 		}
 		segmentFilters[i] = compaction.NewEntityFilter(delta, collectionTTL, currentTime, s.GetCommitTimestamp())
+
+		// Selection must happen against the raw source record.  Function outputs
+		// and missing fields are often expensive to materialize, and rows removed
+		// by delete/TTL must never pay that cost.  The selection helper returns nil
+		// for keep-all records, retaining the original Arrow buffers.
+		sourceHasTTLField := hasTTLField
+		if sourceHasTTLField {
+			_, sourceHasTTLField = existingFields[ttlFieldID]
+		}
+		preMaterializeFilter := len(delta) > 0 || collectionTTL > 0 || sourceHasTTLField
+		if preMaterializeFilter {
+			reader = newSelectedMaterializedRecordReader(reader, materializer, func(rec storage.Record) (*recordSelection, error) {
+				segmentTotalRows[i] += int64(rec.Len())
+				selection, _, err := selectFullRewriteRecord(rec, pkField, segmentFilters[i], ttlFieldID, sourceHasTTLField, nil)
+				return selection, err
+			}, true)
+		} else {
+			reader = newSelectedMaterializedRecordReader(reader, materializer, func(rec storage.Record) (*recordSelection, error) {
+				segmentTotalRows[i] += int64(rec.Len())
+				return nil, nil
+			}, false)
+		}
+		segmentReaders[i] = wrapReaderWithTimestampOverwrite(reader, s.GetCommitTimestamp())
 	}
 
 	var predicate func(r storage.Record, ri, i int) bool
-	segmentTotalRows := make([]int64, len(binlogs))
 	switch pkField.DataType {
-	case schemapb.DataType_Int64:
-		predicate = func(r storage.Record, ri, i int) bool {
-			segmentTotalRows[ri]++
-			pk := r.Column(pkField.FieldID).(*array.Int64).Value(i)
-			ts := r.Column(common.TimeStampField).(*array.Int64).Value(i)
-			expireTs := int64(-1)
-			if hasTTLField {
-				col := r.Column(ttlFieldID).(*array.Int64)
-				if col.IsValid(i) {
-					expireTs = col.Value(i)
-				}
-			}
-			return !segmentFilters[ri].Filtered(pk, uint64(ts), expireTs)
-		}
-	case schemapb.DataType_VarChar:
-		predicate = func(r storage.Record, ri, i int) bool {
-			segmentTotalRows[ri]++
-			pk := r.Column(pkField.FieldID).(*array.String).Value(i)
-			ts := r.Column(common.TimeStampField).(*array.Int64).Value(i)
-			expireTs := int64(-1)
-			if hasTTLField {
-				col := r.Column(ttlFieldID).(*array.Int64)
-				if col.IsValid(i) {
-					expireTs = col.Value(i)
-				}
-			}
-			return !segmentFilters[ri].Filtered(pk, uint64(ts), expireTs)
-		}
+	case schemapb.DataType_Int64, schemapb.DataType_VarChar:
+		// When filtering is active, selectFullRewriteRecord has already evaluated
+		// every raw source row exactly once and accounted for deletions/expiry.
+		// MergeSort still needs a predicate for its contract, so keep rows here.
+		predicate = func(_ storage.Record, _, _ int) bool { return true }
 	default:
 		log.Warn(ctx, "compaction only support int64 and varchar pk field")
 	}
